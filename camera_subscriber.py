@@ -68,7 +68,7 @@ def main():
     subscriber.setsockopt_string(zmq.SUBSCRIBE, "D435i_STREAM")
     print("Subscriber connected to tcp://192.168.252.82:5555 (Bundled message mode)")
 
-    expected_cameras = ["317422071787", "243322073887"]
+    expected_cameras = []  # 将动态检测相机数量
     
     # 性能监控变量
     frame_count = 0
@@ -96,8 +96,13 @@ def main():
             sync_group_count, cameras = unpack_bundled_message(bundled_data)
             frame_count += 1
             
+            # 动态适应相机数量
+            if not expected_cameras and cameras:
+                expected_cameras = list(cameras.keys())
+                print(f"Auto-detected {len(expected_cameras)} cameras: {expected_cameras}")
+            
             # 检查是否收到了所有期望的相机
-            if len(cameras) == len(expected_cameras):
+            if cameras and len(cameras) >= len(expected_cameras):
                 display_frames = []
                 
                 network_latencies = []

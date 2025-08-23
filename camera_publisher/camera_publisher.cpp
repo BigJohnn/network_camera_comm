@@ -16,8 +16,8 @@
 #include <lz4frame.h>
 
 // --- USB连接优化配置 ---
-// FIX: Update serial numbers to match your actual cameras
-const std::vector<std::string> SERIAL_NUMBERS = {"317422071787", "243322073887"};
+// 动态检测已连接的相机
+std::vector<std::string> SERIAL_NUMBERS;
 const std::string ZMQ_ENDPOINT = "tcp://*:5555";
 const std::string ZMQ_TOPIC = "D435i_STREAM";
 
@@ -140,7 +140,6 @@ private:
             for (const std::string& serial : SERIAL_NUMBERS) {
                 auto& buffer = camera_buffers_[serial];
                 std::queue<SimpleFrameData> new_buffer;
-                bool removed = false;
                 
                 // 移除匹配的帧（从后往前找最新的）
                 std::vector<SimpleFrameData> temp_frames;
@@ -204,6 +203,74 @@ private:
         }
     }
 };
+
+// 自动检测已连接的RealSense相机
+std::vector<std::string> detect_connected_cameras() {
+    std::vector<std::string> detected_serials;
+    
+    try {
+        rs2::context ctx;
+        auto devices = ctx.query_devices();
+        
+        std::cout << "\n=== Detecting Connected RealSense Cameras ===" << std::endl;
+        std::cout << "Found " << devices.size() << " device(s)" << std::endl;
+        
+        for (auto&& dev : devices) {
+            try {
+                std::string serial = dev.get_info(RS2_CAMERA_INFO_SERIAL_NUMBER);
+                std::string name = dev.get_info(RS2_CAMERA_INFO_NAME);
+                std::string product_id = dev.get_info(RS2_CAMERA_INFO_PRODUCT_ID);
+                
+                std::cout << "Camera found:" << std::endl;
+                std::cout << "  - Name: " << name << std::endl;
+                std::cout << "  - Serial: " << serial << std::endl;
+                std::cout << "  - Product ID: " << product_id << std::endl;
+                
+                // 检查是否支持所需的流
+                bool has_color = false;
+                bool has_depth = false;
+                
+                auto sensors = dev.query_sensors();
+                for (auto&& sensor : sensors) {
+                    auto profiles = sensor.get_stream_profiles();
+                    for (auto&& profile : profiles) {
+                        if (profile.stream_type() == RS2_STREAM_COLOR) {
+                            has_color = true;
+                        }
+                        if (profile.stream_type() == RS2_STREAM_DEPTH) {
+                            has_depth = true;
+                        }
+                    }
+                }
+                
+                if (has_color && has_depth) {
+                    detected_serials.push_back(serial);
+                    std::cout << "  ✓ Supports color and depth streams - ADDED" << std::endl;
+                } else {
+                    std::cout << "  ✗ Missing required streams (color:" << has_color << " depth:" << has_depth << ") - SKIPPED" << std::endl;
+                }
+                
+                std::cout << std::endl;
+                
+            } catch (const std::exception& e) {
+                std::cerr << "Error getting device info: " << e.what() << std::endl;
+            }
+        }
+        
+        std::cout << "Total cameras to use: " << detected_serials.size() << std::endl;
+        for (size_t i = 0; i < detected_serials.size(); ++i) {
+            std::cout << "  " << (i+1) << ". " << detected_serials[i] << std::endl;
+        }
+        std::cout << "================================================" << std::endl;
+        
+    } catch (const rs2::error& e) {
+        std::cerr << "RealSense error during detection: " << e.what() << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "Error during camera detection: " << e.what() << std::endl;
+    }
+    
+    return detected_serials;
+}
 
 void signal_handler(int signal) {
     if (signal == SIGINT || signal == SIGTERM) {
@@ -449,6 +516,17 @@ int main() {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
+    // 自动检测已连接的相机
+    SERIAL_NUMBERS = detect_connected_cameras();
+    
+    if (SERIAL_NUMBERS.empty()) {
+        std::cerr << "No compatible RealSense cameras found!" << std::endl;
+        std::cerr << "Please ensure your cameras are connected and have both color and depth sensors." << std::endl;
+        return 1;
+    }
+
+    std::cout << "\nUsing " << SERIAL_NUMBERS.size() << " camera(s) for streaming" << std::endl;
+
     // 初始化 ZMQ
     zmq::context_t context(1);
     zmq::socket_t publisher(context, zmq::socket_type::pub);
@@ -462,7 +540,7 @@ int main() {
     std::vector<std::thread> camera_threads;
 
     try {
-        // 初始化所有相机（USB连接模式）
+        // 初始化所有检测到的相机（USB连接模式）
         for (const std::string& serial : SERIAL_NUMBERS) {
             std::cout << "Initializing USB camera " << serial << std::endl;
             rs2::pipeline pipe = setup_usb_camera(serial);
@@ -483,9 +561,10 @@ int main() {
         // 启动 ZMQ 发送执行緒
         std::thread zmq_thread(zmq_publisher_thread_bundled, std::ref(publisher), std::ref(synchronizer));
         
-        std::cout << "\n=== Simplified USB Multi-Camera Publisher Started ===" << std::endl;
-        std::cout << "Sync window: " << SYNC_WINDOW_MS << "ms (system time based)" << std::endl;
+        std::cout << "\n=== Optimized USB Multi-Camera Publisher Started ===" << std::endl;
+        std::cout << "Sync window: " << SYNC_WINDOW_MS << "ms (optimized for low latency)" << std::endl;
         std::cout << "Max buffer size: " << MAX_BUFFER_SIZE << " frames per camera" << std::endl;
+        std::cout << "JPEG quality: 65 (optimized for speed)" << std::endl;
         std::cout << "Press Ctrl+C to stop..." << std::endl;
         
         // 等待退出信號

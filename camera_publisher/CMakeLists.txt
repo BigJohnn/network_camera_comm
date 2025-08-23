@@ -86,16 +86,13 @@ endif()
 
 # 添加可执行文件
 add_executable(camera_publisher camera_publisher.cpp)
-# add_executable(camera_subscriber camera_subscriber.cpp)
 
 # 设置包含目录
 if(realsense2_INCLUDE_DIR)
     target_include_directories(camera_publisher PRIVATE ${realsense2_INCLUDE_DIR})
-    # target_include_directories(camera_subscriber PRIVATE ${realsense2_INCLUDE_DIR})
 else()
     # 如果使用的是CMake配置方式
     target_include_directories(camera_publisher PRIVATE ${realsense2_INCLUDE_DIRS})
-    # target_include_directories(camera_subscriber PRIVATE ${realsense2_INCLUDE_DIRS})
 endif()
 
 target_include_directories(camera_publisher PRIVATE
@@ -103,10 +100,18 @@ target_include_directories(camera_publisher PRIVATE
     ${ZeroMQ_INCLUDE_DIR}
 )
 
-# target_include_directories(camera_subscriber PRIVATE
-#     ${OpenCV_INCLUDE_DIRS}
-#     ${ZeroMQ_INCLUDE_DIR}
-# )
+# 查找LZ4库
+find_library(LZ4_LIBRARY
+    NAMES lz4
+    PATHS
+    /usr/lib
+    /usr/local/lib
+    /usr/lib/x86_64-linux-gnu
+)
+
+if(NOT LZ4_LIBRARY)
+    message(FATAL_ERROR "LZ4 library not found! Please install liblz4-dev")
+endif()
 
 # 链接库
 if(realsense2_LIBRARY)
@@ -114,32 +119,23 @@ if(realsense2_LIBRARY)
         ${realsense2_LIBRARY}
         ${OpenCV_LIBS}
         ${ZeroMQ_LIBRARY}
+        ${LZ4_LIBRARY}
         ${CMAKE_THREAD_LIBS_INIT}
     )
-    # target_link_libraries(camera_subscriber
-    #     ${OpenCV_LIBS}
-    #     ${ZeroMQ_LIBRARY}
-    #     ${CMAKE_THREAD_LIBS_INIT}
-    # )
 else()
     # 使用CMake目标方式
     target_link_libraries(camera_publisher
         realsense2::realsense2
         ${OpenCV_LIBS}
         ${ZeroMQ_LIBRARY}
+        ${LZ4_LIBRARY}
         ${CMAKE_THREAD_LIBS_INIT}
     )
-    # target_link_libraries(camera_subscriber
-    #     ${OpenCV_LIBS}
-    #     ${ZeroMQ_LIBRARY}
-    #     ${CMAKE_THREAD_LIBS_INIT}
-    # )
 endif()
 
 # 设置编译选项
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(camera_publisher PRIVATE -Wall -Wextra -O2)
-    # target_compile_options(camera_subscriber PRIVATE -Wall -Wextra -O2)
 endif()
 
 # 输出配置信息
