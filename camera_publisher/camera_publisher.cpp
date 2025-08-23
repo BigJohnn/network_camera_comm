@@ -27,10 +27,10 @@ const int DEPTH_WIDTH = 640;
 const int DEPTH_HEIGHT = 480;
 const int FPS = 30;
 
-// USB连接专用同步设定 - 简化版本
-const int64_t SYNC_WINDOW_MS = 100;       // 同步窗口 - 增加一些容忍度
-const int64_t MAX_FRAME_AGE_MS = 500;     // 最大帧年龄
-const int MAX_BUFFER_SIZE = 5;           // 每个相机最多保留5帧
+// USB连接专用同步设定 - 优化版本
+const int64_t SYNC_WINDOW_MS = 30;        // 同步窗口 - 减少到30ms提高响应性
+const int64_t MAX_FRAME_AGE_MS = 200;     // 最大帧年龄 - 减少到200ms
+const int MAX_BUFFER_SIZE = 2;            // 每个相机最多保留2帧 - 减少缓存
 
 // 全局变量
 std::atomic<bool> g_running(true);
@@ -158,12 +158,18 @@ private:
                 result.push_back(latest_frames[serial]);
             }
             
-            // 调试输出
+            // 调试输出 - 增加延迟监控
             static int sync_debug_counter = 0;
+            static int64_t last_sync_time = 0;
+            int64_t current_sync_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            
             if (++sync_debug_counter % 30 == 0) {  // 每30次同步输出一次
+                int64_t sync_interval = last_sync_time > 0 ? current_sync_time - last_sync_time : 0;
                 std::cout << "Synchronized " << result.size() << " cameras, time range: " 
-                        << (max_time - min_time) << "ms" << std::endl;
+                        << (max_time - min_time) << "ms, sync interval: " << sync_interval << "ms" << std::endl;
             }
+            last_sync_time = current_sync_time;
         }
         
         return result;
@@ -380,10 +386,10 @@ void zmq_publisher_thread_bundled(zmq::socket_t& publisher, SimplifiedUSBSynchro
             
             // 为每个相机编码数据
             for (const SimpleFrameData& frame_data : synced_frames) {
-                // 编码彩色影像
+                // 编码彩色影像 - 降低质量提高传输速度
                 std::vector<uchar> color_encoded;
                 cv::imencode(".jpg", frame_data.color_mat, color_encoded, 
-                            std::vector<int>{cv::IMWRITE_JPEG_QUALITY, 80});
+                            std::vector<int>{cv::IMWRITE_JPEG_QUALITY, 65});
                 
                 // 序列号长度和内容
                 int32_t serial_len = static_cast<int32_t>(frame_data.serial.length());
@@ -422,9 +428,14 @@ void zmq_publisher_thread_bundled(zmq::socket_t& publisher, SimplifiedUSBSynchro
             publisher.send(zmq::buffer(bundled_message), zmq::send_flags::none);
             
             if (sync_group_count % 30 == 0) {
+                // 计算发送延迟
+                int64_t send_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                int64_t frame_age = send_time - synced_frames[0].system_time;
+                
                 std::cout << "Bundled sync group #" << sync_group_count 
                           << " sent with " << synced_frames.size() << " cameras, size: " 
-                          << bundled_message.size() << " bytes" << std::endl;
+                          << bundled_message.size() << " bytes, frame age: " << frame_age << "ms" << std::endl;
             }
                       
         } catch (const std::exception& e) {
