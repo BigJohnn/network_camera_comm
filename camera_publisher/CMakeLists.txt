@@ -100,6 +100,7 @@ target_include_directories(camera_publisher PRIVATE
     ${ZeroMQ_INCLUDE_DIR}
 )
 
+
 # 查找LZ4库
 find_library(LZ4_LIBRARY
     NAMES lz4
@@ -113,25 +114,88 @@ if(NOT LZ4_LIBRARY)
     message(FATAL_ERROR "LZ4 library not found! Please install liblz4-dev")
 endif()
 
+# 查找ORBBEC SDK - 根据服务器路径结构
+set(ORBBEC_SDK_PATHS
+    # 服务器上的路径
+    ~/Code/OrbbecSDK/OrbbecSDK_v1.10.22/SDK
+    # 相对路径备选
+    ../../OrbbecSDK/OrbbecSDK_v1.10.22/SDK
+    # 传统安装路径
+    /usr/local/OrbbecSDK
+    # 环境变量路径
+    ${ORBBEC_SDK_ROOT}
+)
+
+# 展开用户主目录
+file(TO_CMAKE_PATH "$ENV{HOME}" HOME_DIR)
+
+# 查找头文件
+find_path(ORBBEC_INCLUDE_DIR
+    NAMES libobsensor/ObSensor.hpp
+    PATHS 
+    ${HOME_DIR}/Code/OrbbecSDK/OrbbecSDK_v1.10.22/SDK/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../OrbbecSDK/OrbbecSDK_v1.10.22/SDK/include
+    /usr/local/OrbbecSDK/include
+    /usr/include
+    /usr/local/include
+    ${ORBBEC_SDK_ROOT}/include
+)
+
+# 查找库文件
+find_library(ORBBEC_LIBRARY
+    NAMES libOrbbecSDK OrbbecSDK
+    PATHS
+    ${HOME_DIR}/Code/OrbbecSDK/OrbbecSDK_v1.10.22/SDK/lib
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../OrbbecSDK/OrbbecSDK_v1.10.22/SDK/lib
+    /usr/local/OrbbecSDK/lib
+    /usr/lib
+    /usr/local/lib
+    /usr/lib/x86_64-linux-gnu
+    ${ORBBEC_SDK_ROOT}/lib
+)
+
+if(ORBBEC_INCLUDE_DIR AND ORBBEC_LIBRARY)
+    message(STATUS "ORBBEC SDK found")
+    message(STATUS "ORBBEC include: ${ORBBEC_INCLUDE_DIR}")
+    message(STATUS "ORBBEC library: ${ORBBEC_LIBRARY}")
+    
+    # 添加ORBBEC库目录到运行时库路径
+    get_filename_component(ORBBEC_LIB_DIR ${ORBBEC_LIBRARY} DIRECTORY)
+    set(CMAKE_INSTALL_RPATH ${CMAKE_INSTALL_RPATH} ${ORBBEC_LIB_DIR})
+    
+else()
+    message(FATAL_ERROR "ORBBEC SDK not found! Please check path: ~/Code/OrbbecSDK/OrbbecSDK_v1.10.22/SDK")
+endif()
+
 # 链接库
+set(CAMERA_LIBRARIES ${OpenCV_LIBS} ${ZeroMQ_LIBRARY} ${LZ4_LIBRARY} ${ORBBEC_LIBRARY} ${CMAKE_THREAD_LIBS_INIT})
+
 if(realsense2_LIBRARY)
     target_link_libraries(camera_publisher
         ${realsense2_LIBRARY}
-        ${OpenCV_LIBS}
-        ${ZeroMQ_LIBRARY}
-        ${LZ4_LIBRARY}
-        ${CMAKE_THREAD_LIBS_INIT}
+        ${CAMERA_LIBRARIES}
     )
 else()
     # 使用CMake目标方式
     target_link_libraries(camera_publisher
         realsense2::realsense2
-        ${OpenCV_LIBS}
-        ${ZeroMQ_LIBRARY}
-        ${LZ4_LIBRARY}
-        ${CMAKE_THREAD_LIBS_INIT}
+        ${CAMERA_LIBRARIES}
     )
 endif()
+
+# 添加ORBBEC包含目录
+if(ORBBEC_INCLUDE_DIR)
+    target_include_directories(camera_publisher PRIVATE ${ORBBEC_INCLUDE_DIR})
+    message(STATUS "Adding ORBBEC include directory: ${ORBBEC_INCLUDE_DIR}")
+endif()
+
+# 设置运行时库路径，确保能找到ORBBEC动态库
+set_target_properties(camera_publisher PROPERTIES
+    BUILD_RPATH "${ORBBEC_LIB_DIR}"
+    INSTALL_RPATH "${ORBBEC_LIB_DIR}"
+    BUILD_RPATH_USE_ORIGIN TRUE
+    INSTALL_RPATH_USE_LINK_PATH TRUE
+)
 
 # 设置编译选项
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

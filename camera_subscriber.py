@@ -46,7 +46,21 @@ def unpack_bundled_message(message_data):
             
             # 解码图像
             color_frame = cv2.imdecode(np.frombuffer(color_data, dtype=np.uint8), cv2.IMREAD_COLOR)
-            depth_frame = np.frombuffer(lz4.frame.decompress(depth_data), dtype=np.uint16).reshape(480, 640)
+            
+            # 检查彩色帧解码
+            if color_frame is None:
+                print(f"Error: Failed to decode color frame for camera {serial}")
+                continue
+            elif color_frame.shape[:2] != (480, 640):
+                print(f"Warning: Color frame shape for {serial} is {color_frame.shape} instead of (480, 640)")
+            
+            # 解码深度帧
+            try:
+                decompressed_depth = lz4.frame.decompress(depth_data)
+                depth_frame = np.frombuffer(decompressed_depth, dtype=np.uint16).reshape(480, 640)
+            except Exception as e:
+                print(f"Error: Failed to decode depth frame for camera {serial}: {e}")
+                continue
             
             cameras[serial] = {
                 "color": color_frame,
@@ -69,6 +83,7 @@ def main():
     print("Subscriber connected to tcp://192.168.252.82:5555 (Bundled message mode)")
 
     expected_cameras = []  # 将动态检测相机数量
+    window_created = False  # 跟踪窗口是否已创建
     
     # 性能监控变量
     frame_count = 0
@@ -88,21 +103,47 @@ def main():
             receive_time = int(time.time() * 1000)
             processing_start = time.time()
             
-            # 接收打包消息
-            topic = subscriber.recv_string()
-            bundled_data = subscriber.recv()
+            # 接收打包消息 (带超时)
+            if subscriber.poll(100):  # 缩短等待时间到100ms
+                topic = subscriber.recv_string(zmq.NOBLOCK)
+                bundled_data = subscriber.recv(zmq.NOBLOCK)
+                print(f"Received message with topic: {topic}, data size: {len(bundled_data)} bytes")
+                
+                # 清理积压的消息，只处理最新的
+                messages_dropped = 0
+                while subscriber.poll(0):  # 立即检查是否还有消息
+                    try:
+                        subscriber.recv_string(zmq.NOBLOCK)
+                        subscriber.recv(zmq.NOBLOCK)
+                        messages_dropped += 1
+                    except zmq.Again:
+                        break
+                
+                if messages_dropped > 0:
+                    print(f"Dropped {messages_dropped} old messages to stay current")
+                    
+            else:
+                print("No message received in 100ms...")
+                continue
             
             # 解析打包消息
-            sync_group_count, cameras = unpack_bundled_message(bundled_data)
-            frame_count += 1
-            
-            # 动态适应相机数量
-            if not expected_cameras and cameras:
-                expected_cameras = list(cameras.keys())
-                print(f"Auto-detected {len(expected_cameras)} cameras: {expected_cameras}")
+            try:
+                sync_group_count, cameras = unpack_bundled_message(bundled_data)
+                frame_count += 1
+                print(f"Successfully unpacked {len(cameras)} cameras from sync group #{sync_group_count}")
+                
+                # 动态适应相机数量
+                if not expected_cameras and cameras:
+                    expected_cameras = list(cameras.keys())
+                    print(f"Auto-detected {len(expected_cameras)} cameras: {expected_cameras}")
+            except Exception as e:
+                print(f"Error unpacking message: {e}")
+                continue
             
             # 检查是否收到了所有期望的相机
+            print(f"Processing cameras: received {len(cameras)}, expected {len(expected_cameras)}")
             if cameras and len(cameras) >= len(expected_cameras):
+                print("Starting frame processing...")
                 display_frames = []
                 
                 network_latencies = []
@@ -178,9 +219,22 @@ def main():
                         display_frames.append(combined_camera_view)
 
                 # 显示完美同步的画面
+                print(f"Display frames ready: {len(display_frames)}/{len(expected_cameras)}")
                 if len(display_frames) == len(expected_cameras):
+                    print("Creating final view...")
                     final_view = np.vstack(display_frames)
-                    cv2.imshow('Perfect Synchronized Dual RealSense Stream', final_view)
+                    window_title = f'Multi-Camera Synchronized Stream ({len(expected_cameras)} cameras)'
+                    
+                    # 首次创建窗口时设置属性
+                    if not window_created:
+                        cv2.namedWindow(window_title, cv2.WINDOW_AUTOSIZE)
+                        window_created = True
+                        print(f"Created window: {window_title}")
+                    
+                    print(f"Showing frame #{frame_count}")
+                    cv2.imshow(window_title, final_view)
+                    cv2.waitKey(1)  # 立即处理事件
+                    print("Frame displayed successfully")
                     
                     # 每30帧输出延迟统计
                     if frame_count % 30 == 0:
@@ -200,8 +254,17 @@ def main():
             else:
                 print(f"Warning: Received {len(cameras)} cameras, expected {len(expected_cameras)}")
 
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            # 处理OpenCV事件并检查退出
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("User pressed 'q', exiting...")
                 break
+            elif key != 255:  # 如果按了任何键
+                print(f"Key pressed: {key}")
+            
+            # 定期状态输出
+            if frame_count > 0 and frame_count % 10 == 0:
+                print(f"Processed {frame_count} frames so far...")
 
         except zmq.Again:
             continue
