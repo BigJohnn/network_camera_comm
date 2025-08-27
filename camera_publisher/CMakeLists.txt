@@ -51,7 +51,18 @@ if(NOT realsense2_FOUND)
 endif()
 
 # 查找OpenCV
-find_package(OpenCV REQUIRED)
+#set(OpenCV_DIR "/usr/lib/aarch64-linux-gnu/cmake/opencv4")
+#find_package(OpenCV REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(OpenCV REQUIRED opencv4)
+include_directories(/usr/include/opencv4)
+# 如果你需要指定具体的组件
+# pkg_check_modules(OpenCV REQUIRED opencv4>=4.5)
+
+# 设置包含目录和链接库
+message(STATUS "====${OpenCV_INCLUDE_DIRS}")
+include_directories(${OpenCV_INCLUDE_DIRS})
+link_directories(${OpenCV_LIBRARY_DIRS})
 
 # 查找线程库
 find_package(Threads REQUIRED)
@@ -114,14 +125,13 @@ if(NOT LZ4_LIBRARY)
     message(FATAL_ERROR "LZ4 library not found! Please install liblz4-dev")
 endif()
 
-# 查找ORBBEC SDK - 根据服务器路径结构
+# 查找ORBBEC SDK v2.4.11 - 更新路径和库名
 set(ORBBEC_SDK_PATHS
-    # 服务器上的路径
-    ~/Code/OrbbecSDK/OrbbecSDK_v1.10.22/SDK
-    # 相对路径备选
-    ../../OrbbecSDK/OrbbecSDK_v1.10.22/SDK
+    # OrbbecSDK v2.4.11 路径
+    ~/Code/OrbbecSDK_v2/OrbbecSDK_v2.4.11
+    ../../OrbbecSDK_v2/OrbbecSDK_v2.4.11
     # 传统安装路径
-    /usr/local/OrbbecSDK
+    /usr/local/OrbbecSDK_v2
     # 环境变量路径
     ${ORBBEC_SDK_ROOT}
 )
@@ -129,25 +139,25 @@ set(ORBBEC_SDK_PATHS
 # 展开用户主目录
 file(TO_CMAKE_PATH "$ENV{HOME}" HOME_DIR)
 
-# 查找头文件
+# 查找头文件 - v2.4.11使用include/libobsensor结构
 find_path(ORBBEC_INCLUDE_DIR
     NAMES libobsensor/ObSensor.hpp
     PATHS 
-    ${HOME_DIR}/Code/OrbbecSDK/OrbbecSDK_v1.10.22/SDK/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../OrbbecSDK/OrbbecSDK_v1.10.22/SDK/include
-    /usr/local/OrbbecSDK/include
+    ${HOME_DIR}/Code/OrbbecSDK_v2/OrbbecSDK_v2.4.11/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../OrbbecSDK_v2/OrbbecSDK_v2.4.11/include
+    /usr/local/OrbbecSDK_v2/include
     /usr/include
     /usr/local/include
     ${ORBBEC_SDK_ROOT}/include
 )
 
-# 查找库文件
+# 查找库文件 - v2.4.11可能使用不同的库名
 find_library(ORBBEC_LIBRARY
-    NAMES libOrbbecSDK OrbbecSDK
+    NAMES OrbbecSDK libOrbbecSDK orbbec
     PATHS
-    ${HOME_DIR}/Code/OrbbecSDK/OrbbecSDK_v1.10.22/SDK/lib
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../OrbbecSDK/OrbbecSDK_v1.10.22/SDK/lib
-    /usr/local/OrbbecSDK/lib
+    ${HOME_DIR}/Code/OrbbecSDK_v2/OrbbecSDK_v2.4.11/lib
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../OrbbecSDK_v2/OrbbecSDK_v2.4.11/lib
+    /usr/local/OrbbecSDK_v2/lib
     /usr/lib
     /usr/local/lib
     /usr/lib/x86_64-linux-gnu
@@ -155,7 +165,7 @@ find_library(ORBBEC_LIBRARY
 )
 
 if(ORBBEC_INCLUDE_DIR AND ORBBEC_LIBRARY)
-    message(STATUS "ORBBEC SDK found")
+    message(STATUS "ORBBEC SDK v2.4.11 found")
     message(STATUS "ORBBEC include: ${ORBBEC_INCLUDE_DIR}")
     message(STATUS "ORBBEC library: ${ORBBEC_LIBRARY}")
     
@@ -164,11 +174,16 @@ if(ORBBEC_INCLUDE_DIR AND ORBBEC_LIBRARY)
     set(CMAKE_INSTALL_RPATH ${CMAKE_INSTALL_RPATH} ${ORBBEC_LIB_DIR})
     
 else()
-    message(FATAL_ERROR "ORBBEC SDK not found! Please check path: ~/Code/OrbbecSDK/OrbbecSDK_v1.10.22/SDK")
+    message(FATAL_ERROR "ORBBEC SDK v2.4.11 not found! Please check path: ~/Code/OrbbecSDK_v2/OrbbecSDK_v2.4.11")
 endif()
 
 # 链接库
-set(CAMERA_LIBRARIES ${OpenCV_LIBS} ${ZeroMQ_LIBRARY} ${LZ4_LIBRARY} ${ORBBEC_LIBRARY} ${CMAKE_THREAD_LIBS_INIT})
+set(CAMERA_LIBRARIES ${OpenCV_LIBS} ${ZeroMQ_LIBRARY} ${LZ4_LIBRARY} ${ORBBEC_LIBRARY} ${CMAKE_THREAD_LIBS_INIT}
+/usr/lib/aarch64-linux-gnu/libopencv_core.so.4.5.4d
+    /usr/lib/aarch64-linux-gnu/libopencv_imgproc.so.4.5.4d
+    /usr/lib/aarch64-linux-gnu/libopencv_highgui.so.4.5.4d
+    /usr/lib/aarch64-linux-gnu/libopencv_imgcodecs.so.4.5.4d
+    /usr/lib/aarch64-linux-gnu/libopencv_videoio.so.4.5.4d)
 
 if(realsense2_LIBRARY)
     target_link_libraries(camera_publisher

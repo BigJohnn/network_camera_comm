@@ -17,12 +17,18 @@
 
 // ORBBEC SDK支持
 #include <libobsensor/ObSensor.hpp>
+#include <libobsensor/h/ObTypes.h>
 
-// ORBBEC相机结构
+// ORBBEC相机结构 - 添加callback模式支持
 struct OrbbecCameraContext {
     std::shared_ptr<ob::Device> device;
     std::shared_ptr<ob::Pipeline> pipeline;
     std::string serial;
+    
+    // Callback模式的线程安全帧处理
+    std::mutex frameset_mutex;
+    std::shared_ptr<ob::FrameSet> latest_frameset;
+    std::atomic<bool> new_frame_available{false};
     
     OrbbecCameraContext(const std::string& s) : serial(s) {}
 };
@@ -37,7 +43,7 @@ const int COLOR_WIDTH = 640;
 const int COLOR_HEIGHT = 480;
 const int DEPTH_WIDTH = 640;
 const int DEPTH_HEIGHT = 480;
-const int FPS = 15;  // 降低帧率从30fps到15fps以减少卡顿
+const int FPS = 10;  // 进一步降低帧率到10fps以减少USB带宽压力
 
 // USB连接专用同步设定 - 优化版本
 const int64_t SYNC_WINDOW_MS = 100;        // 同步窗口 - 统一时间戳后缩小到100ms
@@ -232,15 +238,16 @@ private:
     }
 };
 
-// 检测ORBBEC相机
+// 检测ORBBEC相机 - 适配v2.4.11
 std::vector<std::pair<std::string, CameraType>> detect_orbbec_cameras() {
     std::vector<std::pair<std::string, CameraType>> orbbec_cameras;
     
     try {
-        ob::Context context;
-        auto deviceList = context.queryDeviceList();
+        // v2.4.11 Context创建方式
+        auto context = std::make_shared<ob::Context>();
+        auto deviceList = context->queryDeviceList();
         
-        std::cout << "\n=== Detecting Connected ORBBEC Cameras ===" << std::endl;
+        std::cout << "\n=== Detecting Connected ORBBEC Cameras (v2.4.11) ===" << std::endl;
         std::cout << "Found " << deviceList->deviceCount() << " ORBBEC device(s)" << std::endl;
         
         for (uint32_t i = 0; i < deviceList->deviceCount(); i++) {
@@ -268,8 +275,13 @@ std::vector<std::pair<std::string, CameraType>> detect_orbbec_cameras() {
                 }
                 
                 if (has_color && has_depth) {
-                    orbbec_cameras.push_back({serial, CameraType::ORBBEC});
-                    std::cout << "  ✓ Supports color and depth streams - ADDED" << std::endl;
+                    // 禁用Femto Bolt相机测试
+                    if (name.find("Femto Bolt") != std::string::npos) {
+                        std::cout << "  ✗ Femto Bolt camera DISABLED (bolt test disabled)" << std::endl;
+                    } else {
+                        orbbec_cameras.push_back({serial, CameraType::ORBBEC});
+                        std::cout << "  ✓ Supports color and depth streams - ADDED" << std::endl;
+                    }
                 } else {
                     std::cout << "  ✗ Missing required streams - SKIPPED" << std::endl;
                 }
@@ -280,7 +292,7 @@ std::vector<std::pair<std::string, CameraType>> detect_orbbec_cameras() {
         }
         
     } catch (const std::exception& e) {
-        std::cerr << "ORBBEC detection error: " << e.what() << std::endl;
+        std::cerr << "ORBBEC v2.4.11 detection error: " << e.what() << std::endl;
     }
     
     return orbbec_cameras;
@@ -397,17 +409,20 @@ std::vector<char> compress_depth_lz4(const rs2::depth_frame& frame) {
     return compressed_buffer;
 }
 
-// ORBBEC相机初始化函数
-std::shared_ptr<OrbbecCameraContext> setup_orbbec_camera(const std::string& serial) {
+// ORBBEC相机初始化函数 - 适配v2.4.11 + 多设备同步
+std::shared_ptr<OrbbecCameraContext> setup_orbbec_camera(const std::string& serial, bool is_primary = true, std::shared_ptr<ob::Context> shared_context = nullptr) {
     try {
-        ob::Context context;
-        auto deviceList = context.queryDeviceList();
+        // 使用共享Context以便设备同步
+        auto context = shared_context ? shared_context : std::make_shared<ob::Context>();
+        auto deviceList = context->queryDeviceList();
         
         // 查找指定序列号的设备
         std::shared_ptr<ob::Device> target_device = nullptr;
         for (uint32_t i = 0; i < deviceList->deviceCount(); i++) {
-            if (std::string(deviceList->serialNumber(i)) == serial) {
-                target_device = deviceList->getDevice(i);
+            auto device = deviceList->getDevice(i);
+            auto deviceInfo = device->getDeviceInfo();
+            if (std::string(deviceInfo->serialNumber()) == serial) {
+                target_device = device;
                 break;
             }
         }
@@ -420,69 +435,292 @@ std::shared_ptr<OrbbecCameraContext> setup_orbbec_camera(const std::string& seri
         camera_ctx->device = target_device;
         camera_ctx->pipeline = std::make_shared<ob::Pipeline>(target_device);
         
-        // 配置流
+        // === 多设备同步配置 ===
+        try {
+            std::cout << "ORBBEC camera " << serial << " - Configuring multi-device sync (" 
+                      << (is_primary ? "PRIMARY" : "SECONDARY") << " mode)" << std::endl;
+            
+            // 创建多设备同步配置结构
+            OBMultiDeviceSyncConfig syncConfig;
+            memset(&syncConfig, 0, sizeof(syncConfig));
+            
+            // 基于实际相机序列号配置同步模式
+            bool should_be_primary = false;
+            
+            // CP728410006B 工作正常，设为主设备
+            if (serial == "CP728410006B") {
+                should_be_primary = true;
+            }
+            // CP769450002G 有问题，设为从设备  
+            else if (serial == "CP769450002G") {
+                should_be_primary = false;
+            }
+            // CL8M84101W7 Femto Bolt也设为从设备
+            else if (serial == "CL8M84101W7") {
+                should_be_primary = false;
+            }
+            // 其他情况使用传入的参数
+            else {
+                should_be_primary = is_primary;
+            }
+            
+            if (should_be_primary) {
+                // 主设备模式：生成同步信号 (基于原始配置)
+                syncConfig.syncMode = OB_MULTI_DEVICE_SYNC_MODE_PRIMARY;
+                syncConfig.depthDelayUs = 0;
+                syncConfig.colorDelayUs = 0;
+                syncConfig.trigger2ImageDelayUs = 0;
+                syncConfig.triggerOutEnable = true;
+                syncConfig.triggerOutDelayUs = 0;
+                syncConfig.framesPerTrigger = 1;
+                
+                target_device->setMultiDeviceSyncConfig(syncConfig);
+                std::cout << "ORBBEC camera " << serial << " - Set as PRIMARY device (trigger generator)" << std::endl;
+            } else {
+                // 从设备模式：接收同步信号 (基于原始配置，但保持triggerOutEnable=true)
+                syncConfig.syncMode = OB_MULTI_DEVICE_SYNC_MODE_SECONDARY;
+                syncConfig.depthDelayUs = 0;
+                syncConfig.colorDelayUs = 0;
+                syncConfig.trigger2ImageDelayUs = 0;
+                syncConfig.triggerOutEnable = true;  // 根据原始配置，从设备也启用trigger out
+                syncConfig.triggerOutDelayUs = 0;
+                syncConfig.framesPerTrigger = 1;
+                
+                target_device->setMultiDeviceSyncConfig(syncConfig);
+                std::cout << "ORBBEC camera " << serial << " - Set as SECONDARY device (trigger receiver)" << std::endl;
+            }
+            
+            // 启用设备时钟同步
+            if (shared_context) {
+                shared_context->enableDeviceClockSync(3000);  // 3秒同步窗口
+                std::cout << "ORBBEC camera " << serial << " - Enabled device clock synchronization" << std::endl;
+            }
+            
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: Failed to configure multi-device sync for " << serial << ": " << e.what() << std::endl;
+            std::cerr << "Continuing without hardware sync..." << std::endl;
+        }
+        
+        // 配置流 - 尝试多种配置策略
         auto config = std::make_shared<ob::Config>();
+        bool color_configured = false;
+        bool depth_configured = false;
         
-        // 配置彩色流 - 寻找640x480分辨率
-        auto colorProfiles = camera_ctx->pipeline->getStreamProfileList(OB_SENSOR_COLOR);
-        std::shared_ptr<ob::VideoStreamProfile> selectedColorProfile = nullptr;
+        // 检查是否是Femto Bolt相机
+        bool is_femto_bolt = false;
+        try {
+            auto deviceInfo = target_device->getDeviceInfo();
+            std::string device_name = deviceInfo->name();
+            if (device_name.find("Femto Bolt") != std::string::npos) {
+                is_femto_bolt = true;
+                std::cout << "ORBBEC camera " << serial << " - Detected as Femto Bolt, using 720p configuration" << std::endl;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: Could not get device info: " << e.what() << std::endl;
+        }
         
-        if (colorProfiles && colorProfiles->count() > 0) {
-            // 尝试找到640x480分辨率
-            for (uint32_t i = 0; i < colorProfiles->count(); i++) {
-                auto profile = colorProfiles->getProfile(i)->as<ob::VideoStreamProfile>();
-                if (profile->width() == COLOR_WIDTH && profile->height() == COLOR_HEIGHT) {
-                    selectedColorProfile = profile;
-                    break;
+        // 策略1: 根据相机类型选择合适的分辨率配置
+        if (is_femto_bolt) {
+            std::cout << "ORBBEC camera " << serial << " - Trying strategy 1: Femto Bolt 1280x720 configuration" << std::endl;
+        } else {
+            std::cout << "ORBBEC camera " << serial << " - Trying strategy 1: Exact 640x480 configuration" << std::endl;
+        }
+        
+        try {
+            auto colorProfiles = camera_ctx->pipeline->getStreamProfileList(OB_SENSOR_COLOR);
+            auto depthProfiles = camera_ctx->pipeline->getStreamProfileList(OB_SENSOR_DEPTH);
+            
+            // 查找合适的彩色配置
+            std::shared_ptr<ob::VideoStreamProfile> selectedColorProfile = nullptr;
+            if (colorProfiles) {
+                if (is_femto_bolt) {
+                    // Femto Bolt: 查找1280x720配置
+                    for (int fps : {15, 10, 30}) {
+                        for (uint32_t i = 0; i < colorProfiles->count(); i++) {
+                            auto profile = colorProfiles->getProfile(i)->as<ob::VideoStreamProfile>();
+                            if (profile->width() == 1280 && profile->height() == 720 && profile->fps() == static_cast<uint32_t>(fps)) {
+                                selectedColorProfile = profile;
+                                break;
+                            }
+                        }
+                        if (selectedColorProfile) break;
+                    }
+                } else {
+                    // 其他相机: 查找640x480配置
+                    for (int fps : {15, 6, 30}) {
+                        for (uint32_t i = 0; i < colorProfiles->count(); i++) {
+                            auto profile = colorProfiles->getProfile(i)->as<ob::VideoStreamProfile>();
+                            if (profile->width() == 640 && profile->height() == 480 && profile->fps() == static_cast<uint32_t>(fps)) {
+                                selectedColorProfile = profile;
+                                break;
+                            }
+                        }
+                        if (selectedColorProfile) break;
+                    }
                 }
             }
             
-            // 如果没找到640x480，使用第一个可用的
-            if (!selectedColorProfile) {
-                selectedColorProfile = colorProfiles->getProfile(0)->as<ob::VideoStreamProfile>();
-                std::cout << "Warning: ORBBEC camera doesn't support 640x480, using " 
-                          << selectedColorProfile->width() << "x" << selectedColorProfile->height() << std::endl;
-            }
-            
-            config->enableStream(selectedColorProfile);
-            std::cout << "ORBBEC Color stream: " << selectedColorProfile->width() << "x" << selectedColorProfile->height() 
-                      << " @" << selectedColorProfile->fps() << "fps" << std::endl;
-        }
-        
-        // 配置深度流 - 寻找640x480分辨率
-        auto depthProfiles = camera_ctx->pipeline->getStreamProfileList(OB_SENSOR_DEPTH);
-        std::shared_ptr<ob::VideoStreamProfile> selectedDepthProfile = nullptr;
-        
-        if (depthProfiles && depthProfiles->count() > 0) {
-            // 尝试找到640x480分辨率
-            for (uint32_t i = 0; i < depthProfiles->count(); i++) {
-                auto profile = depthProfiles->getProfile(i)->as<ob::VideoStreamProfile>();
-                if (profile->width() == DEPTH_WIDTH && profile->height() == DEPTH_HEIGHT) {
-                    selectedDepthProfile = profile;
-                    break;
+            // 查找合适的深度配置
+            std::shared_ptr<ob::VideoStreamProfile> selectedDepthProfile = nullptr;
+            if (depthProfiles) {
+                if (is_femto_bolt) {
+                    // Femto Bolt: 查找1280x720深度配置
+                    for (int fps : {15, 10}) {
+                        for (uint32_t i = 0; i < depthProfiles->count(); i++) {
+                            auto profile = depthProfiles->getProfile(i)->as<ob::VideoStreamProfile>();
+                            if (profile->width() == 1280 && profile->height() == 720 && profile->fps() == static_cast<uint32_t>(fps)) {
+                                selectedDepthProfile = profile;
+                                break;
+                            }
+                        }
+                        if (selectedDepthProfile) break;
+                    }
+                } else {
+                    // 其他相机: 查找640x480@10fps深度配置
+                    for (uint32_t i = 0; i < depthProfiles->count(); i++) {
+                        auto profile = depthProfiles->getProfile(i)->as<ob::VideoStreamProfile>();
+                        if (profile->width() == 640 && profile->height() == 480 && profile->fps() == 10) {
+                            selectedDepthProfile = profile;
+                            break;
+                        }
+                    }
                 }
             }
             
-            // 如果没找到640x480，使用第一个可用的
-            if (!selectedDepthProfile) {
-                selectedDepthProfile = depthProfiles->getProfile(0)->as<ob::VideoStreamProfile>();
-                std::cout << "Warning: ORBBEC camera doesn't support 640x480 depth, using " 
-                          << selectedDepthProfile->width() << "x" << selectedDepthProfile->height() << std::endl;
+            if (selectedColorProfile && selectedDepthProfile) {
+                config->enableStream(selectedColorProfile);
+                config->enableStream(selectedDepthProfile);
+                color_configured = true;
+                depth_configured = true;
+                if (is_femto_bolt) {
+                    std::cout << "ORBBEC camera " << serial << " - Femto Bolt 1280x720 configuration successful: Color@" 
+                              << selectedColorProfile->fps() << "fps, Depth@" << selectedDepthProfile->fps() << "fps (will resize to 640x480)" << std::endl;
+                } else {
+                    std::cout << "ORBBEC camera " << serial << " - Exact 640x480 configuration successful: Color@" 
+                              << selectedColorProfile->fps() << "fps, Depth@" << selectedDepthProfile->fps() << "fps" << std::endl;
+                }
+            } else {
+                if (is_femto_bolt) {
+                    std::cout << "ORBBEC camera " << serial << " - No 1280x720 profiles found for Femto Bolt" << std::endl;
+                } else {
+                    std::cout << "ORBBEC camera " << serial << " - No 640x480@10fps profiles found" << std::endl;
+                }
             }
-            
-            config->enableStream(selectedDepthProfile);
-            std::cout << "ORBBEC Depth stream: " << selectedDepthProfile->width() << "x" << selectedDepthProfile->height() 
-                      << " @" << selectedDepthProfile->fps() << "fps" << std::endl;
+        } catch (const std::exception& e) {
+            std::cout << "ORBBEC camera " << serial << " - Exact configuration failed: " << e.what() << std::endl;
+            config = std::make_shared<ob::Config>();  // 重置配置
         }
         
-        // 启动Pipeline
-        camera_ctx->pipeline->start(config);
+        // 策略2: 如果自动配置失败，尝试手动配置最低要求
+        if (!color_configured || !depth_configured) {
+            std::cout << "ORBBEC camera " << serial << " - Trying strategy 2: Manual minimal configuration" << std::endl;
+            
+            // 配置彩色流 - 使用任何可用配置
+            try {
+                auto colorProfiles = camera_ctx->pipeline->getStreamProfileList(OB_SENSOR_COLOR);
+                if (colorProfiles && colorProfiles->count() > 0) {
+                    // 使用第一个可用的彩色配置
+                    auto profile = colorProfiles->getProfile(0)->as<ob::VideoStreamProfile>();
+                    config->enableStream(profile);
+                    color_configured = true;
+                    std::cout << "ORBBEC Color stream: " << profile->width() << "x" << profile->height() 
+                              << " @" << profile->fps() << "fps (minimal config)" << std::endl;
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "ORBBEC camera " << serial << " - Failed to configure color stream: " << e.what() << std::endl;
+            }
+            
+            // 配置深度流 - 使用任何可用配置
+            try {
+                auto depthProfiles = camera_ctx->pipeline->getStreamProfileList(OB_SENSOR_DEPTH);
+                if (depthProfiles && depthProfiles->count() > 0) {
+                    // 使用第一个可用的深度配置
+                    auto profile = depthProfiles->getProfile(0)->as<ob::VideoStreamProfile>();
+                    config->enableStream(profile);
+                    depth_configured = true;
+                    std::cout << "ORBBEC Depth stream: " << profile->width() << "x" << profile->height() 
+                              << " @" << profile->fps() << "fps (minimal config)" << std::endl;
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "ORBBEC camera " << serial << " - Failed to configure depth stream: " << e.what() << std::endl;
+            }
+        }
         
-        std::cout << "ORBBEC camera " << serial << " configured successfully" << std::endl;
+        // 策略3: 如果仍然失败，尝试单独配置每个流
+        if (!color_configured || !depth_configured) {
+            std::cout << "ORBBEC camera " << serial << " - Trying strategy 3: Individual stream configuration" << std::endl;
+            config = std::make_shared<ob::Config>();  // 重置配置
+            
+            if (!color_configured) {
+                try {
+                    // 仅启用彩色流
+                    config->enableVideoStream(OB_STREAM_COLOR);
+                    std::cout << "ORBBEC camera " << serial << " - Color stream only configuration" << std::endl;
+                } catch (const std::exception& e) {
+                    std::cerr << "ORBBEC camera " << serial << " - Failed to configure color-only: " << e.what() << std::endl;
+                }
+            }
+            
+            if (!depth_configured && color_configured) {
+                try {
+                    // 尝试添加深度流
+                    config->enableVideoStream(OB_STREAM_DEPTH);
+                    std::cout << "ORBBEC camera " << serial << " - Added depth stream to configuration" << std::endl;
+                } catch (const std::exception& e) {
+                    std::cerr << "ORBBEC camera " << serial << " - Failed to add depth stream: " << e.what() << std::endl;
+                }
+            }
+        }
+        
+        if (!color_configured && !depth_configured) {
+            throw std::runtime_error("Failed to configure any streams for ORBBEC camera " + serial);
+        }
+        
+        // 启动Pipeline - v2.4.11方式，使用callback模式
+        try {
+            // 添加帧同步配置，确保彩色和深度帧同步
+            try {
+                camera_ctx->pipeline->enableFrameSync();
+                std::cout << "ORBBEC camera " << serial << " - Frame synchronization enabled" << std::endl;
+            } catch (const std::exception& e) {
+                std::cerr << "Warning: Could not enable frame sync for " << serial << ": " << e.what() << std::endl;
+            }
+            
+            // 启动pipeline时使用callback模式，基于官方示例
+            camera_ctx->pipeline->start(config, [camera_ctx](std::shared_ptr<ob::FrameSet> frameset) {
+                if (!frameset) return;
+                
+                // 线程安全地更新最新帧
+                std::lock_guard<std::mutex> lock(camera_ctx->frameset_mutex);
+                camera_ctx->latest_frameset = frameset;
+                camera_ctx->new_frame_available = true;
+            });
+            
+            // 验证设备是否真正开始流传输
+            std::cout << "ORBBEC camera " << serial << " pipeline started, testing frameset availability..." << std::endl;
+            
+            // 检查设备连接状态
+            try {
+                auto deviceInfo = target_device->getDeviceInfo();
+                std::cout << "ORBBEC camera " << serial << " device info:" << std::endl;
+                std::cout << "  - Name: " << deviceInfo->name() << std::endl;
+                std::cout << "  - Serial: " << deviceInfo->serialNumber() << std::endl;
+                std::cout << "  - Firmware: " << deviceInfo->firmwareVersion() << std::endl;
+                std::cout << "  - Hardware: " << deviceInfo->hardwareVersion() << std::endl;
+            } catch (const std::exception& e) {
+                std::cerr << "Warning: Failed to get device info: " << e.what() << std::endl;
+            }
+            
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to start ORBBEC pipeline for " << serial << ": " << e.what() << std::endl;
+            throw;
+        }
+        
+        std::cout << "ORBBEC camera " << serial << " (v2.4.11) configured successfully" << std::endl;
         return camera_ctx;
         
     } catch (const std::exception& e) {
-        std::cerr << "ORBBEC camera setup error for " << serial << ": " << e.what() << std::endl;
+        std::cerr << "ORBBEC v2.4.11 camera setup error for " << serial << ": " << e.what() << std::endl;
         throw;
     }
 }
@@ -551,19 +789,70 @@ rs2::pipeline setup_usb_camera(const std::string& serial) {
 }
 
 void orbbec_camera_thread_func(std::shared_ptr<OrbbecCameraContext> camera_ctx, SimplifiedUSBSynchronizer& synchronizer) {
-    std::cout << "ORBBEC camera thread started for " << camera_ctx->serial << std::endl;
+    std::cout << "ORBBEC camera thread (v2.4.11) started for " << camera_ctx->serial << std::endl;
     int frame_count = 0;
+    int consecutive_failures = 0;
 
     while (g_running) {
         try {
-            // 等待帧集
-            auto frameset = camera_ctx->pipeline->waitForFrames(1000);
-            if (!frameset) continue;
+            // v2.4.11 Callback模式 - 从缓存获取最新帧
+            std::shared_ptr<ob::FrameSet> frameset = nullptr;
+            
+            // 检查是否有新帧可用
+            {
+                std::lock_guard<std::mutex> lock(camera_ctx->frameset_mutex);
+                if (camera_ctx->new_frame_available && camera_ctx->latest_frameset) {
+                    frameset = camera_ctx->latest_frameset;
+                    camera_ctx->new_frame_available = false;  // 标记已处理
+                }
+            }
+            
+            // 如果没有新帧，等待一小段时间后继续
+            if (!frameset) {
+                consecutive_failures++;
+                if (consecutive_failures % 50 == 0) {  // 每50次失败输出一次
+                    std::cerr << "ORBBEC Camera " << camera_ctx->serial << " - No new frameset available (failure #" 
+                              << consecutive_failures << ")" << std::endl;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));  // 短暂等待
+                continue;
+            }
 
             auto colorFrame = frameset->colorFrame();
             auto depthFrame = frameset->depthFrame();
 
-            if (!colorFrame || !depthFrame) continue;
+            // 改进的帧检查逻辑：允许一定程度的帧不匹配
+            bool has_color = (colorFrame != nullptr);
+            bool has_depth = (depthFrame != nullptr);
+            
+            if (!has_color && !has_depth) {
+                consecutive_failures++;
+                std::cerr << "ORBBEC Camera " << camera_ctx->serial << " - No frames available (failure #" 
+                          << consecutive_failures << ")" << std::endl;
+                continue;
+            }
+            
+            // 如果只有一种帧类型，尝试等待匹配的帧
+            if (!has_color || !has_depth) {
+                consecutive_failures++;
+                std::cerr << "ORBBEC Camera " << camera_ctx->serial << " - Missing frames (color: " 
+                          << (has_color ? "OK" : "MISSING") << ", depth: " 
+                          << (has_depth ? "OK" : "MISSING") << ", failure #" 
+                          << consecutive_failures << ")" << std::endl;
+                          
+                // 如果连续失败太多次，跳过这次处理但不退出
+                if (consecutive_failures > 20) {
+                    std::cerr << "ORBBEC Camera " << camera_ctx->serial 
+                              << " - Too many frame mismatches, may have sync issues" << std::endl;
+                    consecutive_failures = 0;  // 重置计数器
+                }
+                continue;
+            }
+            
+            // 重置失败计数器
+            consecutive_failures = 0;
+            int64_t current_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
             
             // 记录系统接收时间
             int64_t system_time = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -590,23 +879,53 @@ void orbbec_camera_thread_func(std::shared_ptr<OrbbecCameraContext> camera_ctx, 
                 continue;
             }
             
+            // 调试: 输出彩色帧尺寸（特别是Femto Bolt）
+            static std::map<std::string, bool> logged_color_size;
+            if (!logged_color_size[camera_ctx->serial]) {
+                std::cout << "ORBBEC camera " << camera_ctx->serial << " - Color frame size: " 
+                          << color_mat.cols << "x" << color_mat.rows << std::endl;
+                logged_color_size[camera_ctx->serial] = true;
+            }
+            
             // 统一分辨率：智能调整ORBBEC相机帧到640x480
             if (color_mat.cols != COLOR_WIDTH || color_mat.rows != COLOR_HEIGHT) {
+                // 特殊处理Femto Bolt的1280x720分辨率
+                bool is_femto_size = (color_mat.cols == 1280 && color_mat.rows == 720);
+                
                 // 计算宽高比
                 float src_ratio = (float)color_mat.cols / color_mat.rows;
                 float dst_ratio = (float)COLOR_WIDTH / COLOR_HEIGHT;
                 
-                if (abs(src_ratio - dst_ratio) < 0.01) {
+                if (is_femto_size) {
+                    // Femto Bolt: 1280x720 -> 640x480, 需要裁剪或缩放
+                    // 720p (16:9) -> 480p (4:3), 宽高比不同，需要裁剪
+                    int crop_width = color_mat.rows * 4 / 3; // 720 * 4/3 = 960
+                    int start_x = (color_mat.cols - crop_width) / 2; // (1280-960)/2 = 160
+                    
+                    cv::Rect crop_rect(start_x, 0, crop_width, color_mat.rows);
+                    cv::Mat cropped_color = color_mat(crop_rect).clone();
+                    
+                    // 然后缩放到640x480
+                    cv::Mat resized_color;
+                    cv::resize(cropped_color, resized_color, cv::Size(COLOR_WIDTH, COLOR_HEIGHT));
+                    color_mat = resized_color;
+                    
+                    static std::map<std::string, bool> logged_femto_resize;
+                    if (!logged_femto_resize[camera_ctx->serial]) {
+                        std::cout << "ORBBEC Femto Bolt " << camera_ctx->serial << " - Cropped 1280x720 to 960x720 then resized to 640x480" << std::endl;
+                        logged_femto_resize[camera_ctx->serial] = true;
+                    }
+                } else if (abs(src_ratio - dst_ratio) < 0.01) {
                     // 宽高比一致，使用resize
                     cv::Mat resized_color;
                     cv::resize(color_mat, resized_color, cv::Size(COLOR_WIDTH, COLOR_HEIGHT));
                     color_mat = resized_color;
                     
-                    static bool logged_resize = false;
-                    if (!logged_resize) {
-                        std::cout << "ORBBEC camera resized from " << colorFrame->width() << "x" << colorFrame->height() 
+                    static std::map<std::string, bool> logged_resize;
+                    if (!logged_resize[camera_ctx->serial]) {
+                        std::cout << "ORBBEC camera " << camera_ctx->serial << " resized from " << colorFrame->width() << "x" << colorFrame->height() 
                                   << " to " << COLOR_WIDTH << "x" << COLOR_HEIGHT << " (same aspect ratio)" << std::endl;
-                        logged_resize = true;
+                        logged_resize[camera_ctx->serial] = true;
                     }
                 } else if (color_mat.cols == COLOR_WIDTH) {
                     // 宽度相同，高度不同，使用crop
@@ -637,6 +956,14 @@ void orbbec_camera_thread_func(std::shared_ptr<OrbbecCameraContext> camera_ctx, 
             
             // 处理深度帧 - 压缩深度数据
             cv::Mat depth_mat(depthFrame->height(), depthFrame->width(), CV_16UC1, (void*)depthFrame->data());
+            
+            // 调试: 输出深度帧尺寸（特别是Femto Bolt）
+            static std::map<std::string, bool> logged_depth_size;
+            if (!logged_depth_size[camera_ctx->serial]) {
+                std::cout << "ORBBEC camera " << camera_ctx->serial << " - Depth frame size: " 
+                          << depth_mat.cols << "x" << depth_mat.rows << std::endl;
+                logged_depth_size[camera_ctx->serial] = true;
+            }
             
             // 统一深度帧分辨率：智能调整ORBBEC深度帧到640x480
             if (depth_mat.cols != DEPTH_WIDTH || depth_mat.rows != DEPTH_HEIGHT) {
@@ -697,16 +1024,18 @@ void orbbec_camera_thread_func(std::shared_ptr<OrbbecCameraContext> camera_ctx, 
             // 添加到同步器
             synchronizer.add_frame(frame_data);
             
-            // 每30帧输出一次调试信息
+            // 每30帧输出一次详细调试信息
             if (frame_count % 30 == 0) {
                 std::cout << "ORBBEC Camera " << camera_ctx->serial << " - Frame " << frame_count 
                           << ", Timestamp: " << camera_timestamp 
-                          << ", System Time: " << system_time << std::endl;
+                          << ", System Time: " << system_time 
+                          << ", Health: " << consecutive_failures << " failures" << std::endl;
             }
             
-            // 每帧都输出简单状态（临时调试）
+            // 每10帧输出简单状态（包含健康状态）
             if (frame_count % 10 == 0) {
-                std::cout << "ORBBEC " << camera_ctx->serial << " alive: Frame " << frame_count << std::endl;
+                std::cout << "ORBBEC " << camera_ctx->serial << " alive: Frame " << frame_count 
+                          << " (health: " << (consecutive_failures == 0 ? "GOOD" : "DEGRADED") << ")" << std::endl;
             }
             
         } catch (const std::exception& e) {
@@ -906,17 +1235,129 @@ int main() {
     std::vector<std::shared_ptr<OrbbecCameraContext>> orbbec_cameras;
     std::vector<std::thread> camera_threads;
 
+    // 为ORBBEC相机创建共享Context以支持多设备同步
+    std::shared_ptr<ob::Context> orbbec_context = nullptr;
+    std::vector<std::string> orbbec_serials;
+    
+    // 分离ORBBEC相机序列号
+    for (const auto& camera : detected_cameras) {
+        if (camera.second == CameraType::ORBBEC) {
+            orbbec_serials.push_back(camera.first);
+        }
+    }
+    
+    // 如果有多个ORBBEC相机，创建共享Context
+    if (orbbec_serials.size() > 1) {
+        orbbec_context = std::make_shared<ob::Context>();
+        std::cout << "Created shared ORBBEC context for " << orbbec_serials.size() << " cameras" << std::endl;
+    }
+
     try {
-        // 初始化所有相机
-        for (const std::string& serial : SERIAL_NUMBERS) {
+        // 初始化所有相机 - 改进的ORBBEC多设备同步序列
+        
+        // 1. 先初始化所有RealSense相机
+        for (size_t i = 0; i < SERIAL_NUMBERS.size(); ++i) {
+            const std::string& serial = SERIAL_NUMBERS[i];
+            
             if (camera_types[serial] == CameraType::REALSENSE) {
                 std::cout << "Initializing RealSense camera " << serial << std::endl;
                 rs2::pipeline pipe = setup_usb_camera(serial);
                 pipelines.push_back(std::move(pipe));
-            } else if (camera_types[serial] == CameraType::ORBBEC) {
-                std::cout << "Initializing ORBBEC camera " << serial << std::endl;
-                auto orbbec_ctx = setup_orbbec_camera(serial);
-                orbbec_cameras.push_back(orbbec_ctx);
+            }
+        }
+        
+        // 2. 然后按照ORBBEC官方建议：先初始化从设备，再初始化主设备
+        if (!orbbec_serials.empty()) {
+            std::cout << "\n=== ORBBEC Multi-Device Sync Sequence ===" << std::endl;
+            
+            // 先初始化所有从设备 (CP769450002G) - 禁用Femto Bolt测试
+            std::vector<std::string> secondary_devices = {"CP769450002G"};
+            for (const std::string& secondary_serial : secondary_devices) {
+                // 检查该从设备是否存在于orbbec_serials中
+                bool found = false;
+                for (const std::string& serial : orbbec_serials) {
+                    if (serial == secondary_serial) {
+                        found = true;
+                        break;
+                    }
+                }
+                
+                if (!found) continue; // 跳过不存在的从设备
+                
+                if (secondary_serial == "CP769450002G") {
+                    std::cout << "Initializing ORBBEC SECONDARY device " << secondary_serial << " (Gemini 336 - problematic)" << std::endl;
+                } else if (secondary_serial == "CL8M84101W7") {
+                    std::cout << "Initializing ORBBEC SECONDARY device " << secondary_serial << " (Femto Bolt - 720p)" << std::endl;
+                }
+                
+                // 添加延迟避免USB冲突
+                int delay_ms = 3000;
+                std::cout << "Adding " << delay_ms << "ms delay before initializing secondary camera" << std::endl;
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+                
+                // 重试机制初始化从设备
+                int max_retries = 3;
+                bool success = false;
+                
+                for (int retry = 0; retry < max_retries && !success; ++retry) {
+                    try {
+                        if (retry > 0) {
+                            std::cout << "Retrying ORBBEC SECONDARY camera " << secondary_serial << " initialization (attempt " << (retry + 1) << "/" << max_retries << ")" << std::endl;
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1000 * retry));
+                        }
+                        
+                        auto orbbec_ctx = setup_orbbec_camera(secondary_serial, false, orbbec_context);  // false = 从设备（但实际基于序列号判断）
+                        orbbec_cameras.push_back(orbbec_ctx);
+                        success = true;
+                        
+                    } catch (const std::exception& e) {
+                        std::cerr << "Failed to initialize ORBBEC SECONDARY camera " << secondary_serial 
+                                  << " (attempt " << (retry + 1) << "/" << max_retries << "): " << e.what() << std::endl;
+                        
+                        if (retry == max_retries - 1) {
+                            std::cerr << "WARNING: Failed to initialize ORBBEC SECONDARY camera " << secondary_serial << " after " << max_retries << " attempts!" << std::endl;
+                            // 不抛出异常，继续处理其他相机
+                        }
+                    }
+                }
+            }
+            
+            // 然后初始化主设备 CP728410006B
+            for (const std::string& serial : orbbec_serials) {
+                if (serial == "CP728410006B") {  // 工作正常的相机作为主设备
+                    std::cout << "Initializing ORBBEC PRIMARY device " << serial << std::endl;
+                    
+                    // 给从设备稍微多一些启动时间
+                    std::cout << "Allowing 5s for secondary device to stabilize..." << std::endl;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+                    
+                    // 重试机制初始化主设备
+                    int max_retries = 3;
+                    bool success = false;
+                    
+                    for (int retry = 0; retry < max_retries && !success; ++retry) {
+                        try {
+                            if (retry > 0) {
+                                std::cout << "Retrying ORBBEC PRIMARY camera " << serial << " initialization (attempt " << (retry + 1) << "/" << max_retries << ")" << std::endl;
+                                std::this_thread::sleep_for(std::chrono::milliseconds(1000 * retry));
+                            }
+                            
+                            auto orbbec_ctx = setup_orbbec_camera(serial, true, orbbec_context);  // true = 主设备（但实际基于序列号判断）
+                            orbbec_cameras.push_back(orbbec_ctx);  // 按顺序添加
+                            success = true;
+                            
+                        } catch (const std::exception& e) {
+                            std::cerr << "Failed to initialize ORBBEC PRIMARY camera " << serial 
+                                      << " (attempt " << (retry + 1) << "/" << max_retries << "): " << e.what() << std::endl;
+                            
+                            if (retry == max_retries - 1) {
+                                std::cerr << "ERROR: Failed to initialize ORBBEC PRIMARY camera " << serial << " after " << max_retries << " attempts!" << std::endl;
+                                throw;
+                            }
+                        }
+                    }
+                    break;  // 只处理一个主设备
+                }
             }
         }
         
