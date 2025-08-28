@@ -512,7 +512,7 @@ rs2::pipeline setup_usb_camera(const std::string& serial) {
                 if (color_sensor.supports(RS2_OPTION_ENABLE_AUTO_EXPOSURE)) {
                     color_sensor.set_option(RS2_OPTION_ENABLE_AUTO_EXPOSURE, 0);
                     // 大幅降低曝光值 - 根据环境调整
-                    color_sensor.set_option(RS2_OPTION_EXPOSURE, 600);  // 从8500降到3000
+                    color_sensor.set_option(RS2_OPTION_EXPOSURE, 200);  // 从8500降到3000
                     std::cout << "Set fixed exposure to 3000" << std::endl;
                 }
                 
@@ -699,9 +699,9 @@ void orbbec_camera_thread_func(std::shared_ptr<OrbbecCameraContext> camera_ctx, 
             
             // 每30帧输出一次调试信息
             if (frame_count % 30 == 0) {
-                std::cout << "ORBBEC Camera " << camera_ctx->serial << " - Frame " << frame_count 
-                          << ", Timestamp: " << camera_timestamp 
-                          << ", System Time: " << system_time << std::endl;
+                // std::cout << "ORBBEC Camera " << camera_ctx->serial << " - Frame " << frame_count 
+                //           << ", Timestamp: " << camera_timestamp 
+                //           << ", System Time: " << system_time << std::endl;
             }
             
             // 每帧都输出简单状态（临时调试）
@@ -755,12 +755,12 @@ void camera_thread_func(rs2::pipeline& pipe, const std::string& serial, Simplifi
             synchronizer.add_frame(frame_data);
             
             // 每30帧输出一次调试信息
-            if (frame_count % 30 == 0) {
-                std::cout << "Camera " << serial << " - Frame " << frame_count 
-                          << ", Camera TS: " << camera_timestamp 
-                          << ", System Time: " << system_time 
-                          << " (diff: " << (system_time - camera_timestamp) << "ms)" << std::endl;
-            }
+            // if (frame_count % 30 == 0) {
+            //     std::cout << "Camera " << serial << " - Frame " << frame_count 
+            //               << ", Camera TS: " << camera_timestamp 
+            //               << ", System Time: " << system_time 
+            //               << " (diff: " << (system_time - camera_timestamp) << "ms)" << std::endl;
+            // }
             
         } catch (const rs2::error& e) {
             std::cerr << "RealSense error in thread for " << serial << ": " << e.what() << std::endl;
@@ -788,7 +788,7 @@ void zmq_publisher_thread_bundled(zmq::socket_t& publisher, SimplifiedUSBSynchro
             continue;
         }
         
-        std::cout << "ZMQ: Got " << synced_frames.size() << " synchronized frames" << std::endl;
+        // std::cout << "ZMQ: Got " << synced_frames.size() << " synchronized frames" << std::endl;
         
         try {
             sync_group_count++;
@@ -848,9 +848,9 @@ void zmq_publisher_thread_bundled(zmq::socket_t& publisher, SimplifiedUSBSynchro
             publisher.send(zmq::buffer(ZMQ_TOPIC), zmq::send_flags::sndmore);
             publisher.send(zmq::buffer(bundled_message), zmq::send_flags::none);
             
-            std::cout << "Sent sync group #" << sync_group_count 
-                      << " with " << synced_frames.size() << " cameras, size: " 
-                      << bundled_message.size() << " bytes" << std::endl;
+            // std::cout << "Sent sync group #" << sync_group_count 
+            //           << " with " << synced_frames.size() << " cameras, size: " 
+            //           << bundled_message.size() << " bytes" << std::endl;
             
             if (sync_group_count % 30 == 0) {
                 // 计算发送延迟
