@@ -1,7 +1,7 @@
 #!/bin/bash
 
-mkdir build
-cd build
+mkdir build && cd build
 cmake ..
-make -j${nproc}
-sudo ./camera_publisher
+make -j ${nproc}
+sudo make install
+camera_publisher

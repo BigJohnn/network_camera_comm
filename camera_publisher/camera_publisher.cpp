@@ -750,7 +750,7 @@ rs2::pipeline setup_usb_camera(const std::string& serial) {
                 if (color_sensor.supports(RS2_OPTION_ENABLE_AUTO_EXPOSURE)) {
                     color_sensor.set_option(RS2_OPTION_ENABLE_AUTO_EXPOSURE, 0);
                     // 大幅降低曝光值 - 根据环境调整
-                    color_sensor.set_option(RS2_OPTION_EXPOSURE, 600);  // 从8500降到3000
+                    color_sensor.set_option(RS2_OPTION_EXPOSURE, 200);  // 从8500降到3000
                     std::cout << "Set fixed exposure to 3000" << std::endl;
                 }
                 
@@ -1117,7 +1117,7 @@ void zmq_publisher_thread_bundled(zmq::socket_t& publisher, SimplifiedUSBSynchro
             continue;
         }
         
-        std::cout << "ZMQ: Got " << synced_frames.size() << " synchronized frames" << std::endl;
+        // std::cout << "ZMQ: Got " << synced_frames.size() << " synchronized frames" << std::endl;
         
         try {
             sync_group_count++;
@@ -1177,9 +1177,9 @@ void zmq_publisher_thread_bundled(zmq::socket_t& publisher, SimplifiedUSBSynchro
             publisher.send(zmq::buffer(ZMQ_TOPIC), zmq::send_flags::sndmore);
             publisher.send(zmq::buffer(bundled_message), zmq::send_flags::none);
             
-            std::cout << "Sent sync group #" << sync_group_count 
-                      << " with " << synced_frames.size() << " cameras, size: " 
-                      << bundled_message.size() << " bytes" << std::endl;
+            // std::cout << "Sent sync group #" << sync_group_count 
+            //           << " with " << synced_frames.size() << " cameras, size: " 
+            //           << bundled_message.size() << " bytes" << std::endl;
             
             if (sync_group_count % 30 == 0) {
                 // 计算发送延迟
