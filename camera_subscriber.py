@@ -79,8 +79,12 @@ def main():
     context = zmq.Context()
     subscriber = context.socket(zmq.SUB)
     subscriber.connect("tcp://192.168.252.82:5555")
+    # subscriber.connect("tcp://192.168.1.234:5555")
+    # subscriber.connect("tcp://192.168.35.213:5555")
+    # subscriber.connect("tcp://192.168.11.2:5555")
+    
     subscriber.setsockopt_string(zmq.SUBSCRIBE, "D435i_STREAM")
-    print("Subscriber connected to tcp://192.168.252.82:5555 (Bundled message mode)")
+    # print("Subscriber connected to tcp://192.168.252.82:5555 (Bundled message mode)")
 
     expected_cameras = []  # 将动态检测相机数量
     window_created = False  # 跟踪窗口是否已创建
