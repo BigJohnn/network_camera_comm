@@ -397,7 +397,7 @@ std::shared_ptr<OrbbecCameraContext> setup_orbbec_camera(std::shared_ptr<ob::Dev
                     
                     // Look for 640x480 with any supported format
                     if (width == 640 && height == 480) {
-                        if (!selectedColorProfile || profile->fps() <= 15) {  // Prefer lower fps for stability
+                        if (!selectedColorProfile || (profile->fps() <= 30 && profile->fps() >= 15)) {  // Prefer 15-30fps for stability
                             selectedColorProfile = profile;
                             std::cout << "  -> Selected 640x480 @" << fps << "fps" << std::endl;
                         }
@@ -407,13 +407,17 @@ std::shared_ptr<OrbbecCameraContext> setup_orbbec_camera(std::shared_ptr<ob::Dev
                 // If no 640x480 found, we'll resize from 1280x720 later
                 if (!selectedColorProfile) {
                     std::cout << "No 640x480 color profile found, will use 1280x720 and resize" << std::endl;
-                    // Find 1280x720 profile as fallback
+                    // Find 1280x720 profile as fallback, prefer 15-30fps
                     for (uint32_t i = 0; i < colorProfiles->count(); i++) {
                         auto profile = colorProfiles->getProfile(i)->as<ob::VideoStreamProfile>();
                         if (profile->width() == 1280 && profile->height() == 720) {
-                            selectedColorProfile = profile;
-                            std::cout << "  -> Using 1280x720 @" << profile->fps() << "fps for resizing" << std::endl;
-                            break;
+                            if (!selectedColorProfile || (profile->fps() <= 30 && profile->fps() >= 15)) {
+                                selectedColorProfile = profile;
+                                std::cout << "  -> Using 1280x720 @" << profile->fps() << "fps for resizing" << std::endl;
+                            }
+                            if (profile->fps() <= 30 && profile->fps() >= 15) {
+                                break; // Found good fps range, stop looking
+                            }
                         }
                     }
                 }
@@ -432,24 +436,32 @@ std::shared_ptr<OrbbecCameraContext> setup_orbbec_camera(std::shared_ptr<ob::Dev
             std::shared_ptr<ob::VideoStreamProfile> selectedDepthProfile = nullptr;
             
             if (depthProfiles) {
-                // Try to find 640x480 depth
+                // Try to find 640x480 depth, prefer 15-30fps
                 for (uint32_t i = 0; i < depthProfiles->count(); i++) {
                     auto profile = depthProfiles->getProfile(i)->as<ob::VideoStreamProfile>();
                     if (profile->width() == 640 && profile->height() == 480) {
-                        selectedDepthProfile = profile;
-                        std::cout << "Selected depth: 640x480 @" << profile->fps() << "fps" << std::endl;
-                        break;
+                        if (!selectedDepthProfile || (profile->fps() <= 30 && profile->fps() >= 15)) {
+                            selectedDepthProfile = profile;
+                            std::cout << "Selected depth: 640x480 @" << profile->fps() << "fps" << std::endl;
+                        }
+                        if (profile->fps() <= 30 && profile->fps() >= 15) {
+                            break; // Found good fps range, stop looking
+                        }
                     }
                 }
                 
-                // If no 640x480, try 640x576 (common ORBBEC depth resolution)
+                // If no 640x480, try 640x576 (common ORBBEC depth resolution), prefer 15-30fps
                 if (!selectedDepthProfile) {
                     for (uint32_t i = 0; i < depthProfiles->count(); i++) {
                         auto profile = depthProfiles->getProfile(i)->as<ob::VideoStreamProfile>();
                         if (profile->width() == 640 && profile->height() == 576) {
-                            selectedDepthProfile = profile;
-                            std::cout << "Selected depth: 640x576 @" << profile->fps() << "fps (will crop)" << std::endl;
-                            break;
+                            if (!selectedDepthProfile || (profile->fps() <= 30 && profile->fps() >= 15)) {
+                                selectedDepthProfile = profile;
+                                std::cout << "Selected depth: 640x576 @" << profile->fps() << "fps (will crop)" << std::endl;
+                            }
+                            if (profile->fps() <= 30 && profile->fps() >= 15) {
+                                break; // Found good fps range, stop looking
+                            }
                         }
                     }
                 }
