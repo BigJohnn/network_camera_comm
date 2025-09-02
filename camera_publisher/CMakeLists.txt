@@ -178,12 +178,13 @@ else()
 endif()
 
 # 链接库
-set(CAMERA_LIBRARIES ${OpenCV_LIBS} ${ZeroMQ_LIBRARY} ${LZ4_LIBRARY} ${ORBBEC_LIBRARY} ${CMAKE_THREAD_LIBS_INIT}
-/usr/lib/aarch64-linux-gnu/libopencv_core.so.4.5.4d
-    /usr/lib/aarch64-linux-gnu/libopencv_imgproc.so.4.5.4d
-    /usr/lib/aarch64-linux-gnu/libopencv_highgui.so.4.5.4d
-    /usr/lib/aarch64-linux-gnu/libopencv_imgcodecs.so.4.5.4d
-    /usr/lib/aarch64-linux-gnu/libopencv_videoio.so.4.5.4d)
+set(CAMERA_LIBRARIES 
+    ${OpenCV_LIBRARIES}
+    ${ZeroMQ_LIBRARY} 
+    ${LZ4_LIBRARY} 
+    ${ORBBEC_LIBRARY} 
+    Threads::Threads
+)
 
 if(realsense2_LIBRARY)
     target_link_libraries(camera_publisher
