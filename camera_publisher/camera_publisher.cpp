@@ -221,6 +221,15 @@ cv::Mat convertOrbbecFrame(std::shared_ptr<ob::ColorFrame> colorFrame, const std
     if (!logged_format[serial]) {
         std::cout << "ORBBEC camera " << serial << " - Color format: " << format 
                   << " (" << width << "x" << height << ")" << std::endl;
+        
+        // Format code reference for ORBBEC
+        if (format == OB_FORMAT_MJPG) {
+            std::cout << "  Format " << format << " = MJPG" << std::endl;
+        } else if (format == OB_FORMAT_YUYV) {
+            std::cout << "  Format " << format << " = YUYV" << std::endl;
+        } else if (format == OB_FORMAT_RGB888) {
+            std::cout << "  Format " << format << " = RGB888" << std::endl;
+        }
         logged_format[serial] = true;
     }
     
@@ -251,7 +260,7 @@ cv::Mat convertOrbbecFrame(std::shared_ptr<ob::ColorFrame> colorFrame, const std
                 }
                 break;
                 
-            case OB_FORMAT_MJPG:
+            case OB_FORMAT_MJPG:  // This is format code 5 in your SDK
                 {
                     std::vector<uint8_t> jpeg_data(
                         static_cast<const uint8_t*>(colorFrame->data()),
@@ -355,17 +364,116 @@ std::vector<std::pair<std::string, CameraType>> detect_orbbec_cameras() {
     return orbbec_cameras;
 }
 
-// Setup ORBBEC camera - simplified based on official example
+// Setup ORBBEC camera - force 640x480 resolution
 std::shared_ptr<OrbbecCameraContext> setup_orbbec_camera(std::shared_ptr<ob::Device> device, const std::string& serial, int device_index) {
     try {
         auto camera_ctx = std::make_shared<OrbbecCameraContext>(serial, device_index);
         camera_ctx->device = device;
         camera_ctx->pipeline = std::make_shared<ob::Pipeline>(device);
         
-        // Simple configuration - let SDK choose best profiles
         auto config = std::make_shared<ob::Config>();
-        config->enableVideoStream(OB_STREAM_COLOR);
-        config->enableVideoStream(OB_STREAM_DEPTH);
+        
+        // Get available stream profiles and select 640x480
+        try {
+            // Get color stream profiles
+            auto colorProfiles = camera_ctx->pipeline->getStreamProfileList(OB_SENSOR_COLOR);
+            std::shared_ptr<ob::VideoStreamProfile> selectedColorProfile = nullptr;
+            
+            if (colorProfiles) {
+                std::cout << "ORBBEC camera " << serial << " - Available color profiles:" << std::endl;
+                
+                // First try to find exact 640x480 profile
+                for (uint32_t i = 0; i < colorProfiles->count(); i++) {
+                    auto profile = colorProfiles->getProfile(i)->as<ob::VideoStreamProfile>();
+                    int width = profile->width();
+                    int height = profile->height();
+                    int fps = profile->fps();
+                    auto format = profile->format();
+                    
+                    // Debug output
+                    if (width == 640 || width == 1280) {
+                        std::cout << "  " << width << "x" << height << " @" << fps << "fps, format: " << format << std::endl;
+                    }
+                    
+                    // Look for 640x480 with any supported format
+                    if (width == 640 && height == 480) {
+                        if (!selectedColorProfile || profile->fps() <= 15) {  // Prefer lower fps for stability
+                            selectedColorProfile = profile;
+                            std::cout << "  -> Selected 640x480 @" << fps << "fps" << std::endl;
+                        }
+                    }
+                }
+                
+                // If no 640x480 found, we'll resize from 1280x720 later
+                if (!selectedColorProfile) {
+                    std::cout << "No 640x480 color profile found, will use 1280x720 and resize" << std::endl;
+                    // Find 1280x720 profile as fallback
+                    for (uint32_t i = 0; i < colorProfiles->count(); i++) {
+                        auto profile = colorProfiles->getProfile(i)->as<ob::VideoStreamProfile>();
+                        if (profile->width() == 1280 && profile->height() == 720) {
+                            selectedColorProfile = profile;
+                            std::cout << "  -> Using 1280x720 @" << profile->fps() << "fps for resizing" << std::endl;
+                            break;
+                        }
+                    }
+                }
+                
+                if (selectedColorProfile) {
+                    config->enableStream(selectedColorProfile);
+                } else {
+                    // Fallback to auto selection
+                    config->enableVideoStream(OB_STREAM_COLOR);
+                    std::cout << "Using auto color stream selection" << std::endl;
+                }
+            }
+            
+            // Get depth stream profiles  
+            auto depthProfiles = camera_ctx->pipeline->getStreamProfileList(OB_SENSOR_DEPTH);
+            std::shared_ptr<ob::VideoStreamProfile> selectedDepthProfile = nullptr;
+            
+            if (depthProfiles) {
+                // Try to find 640x480 depth
+                for (uint32_t i = 0; i < depthProfiles->count(); i++) {
+                    auto profile = depthProfiles->getProfile(i)->as<ob::VideoStreamProfile>();
+                    if (profile->width() == 640 && profile->height() == 480) {
+                        selectedDepthProfile = profile;
+                        std::cout << "Selected depth: 640x480 @" << profile->fps() << "fps" << std::endl;
+                        break;
+                    }
+                }
+                
+                // If no 640x480, try 640x576 (common ORBBEC depth resolution)
+                if (!selectedDepthProfile) {
+                    for (uint32_t i = 0; i < depthProfiles->count(); i++) {
+                        auto profile = depthProfiles->getProfile(i)->as<ob::VideoStreamProfile>();
+                        if (profile->width() == 640 && profile->height() == 576) {
+                            selectedDepthProfile = profile;
+                            std::cout << "Selected depth: 640x576 @" << profile->fps() << "fps (will crop)" << std::endl;
+                            break;
+                        }
+                    }
+                }
+                
+                // Last resort: use any available depth profile
+                if (!selectedDepthProfile && depthProfiles->count() > 0) {
+                    selectedDepthProfile = depthProfiles->getProfile(0)->as<ob::VideoStreamProfile>();
+                    std::cout << "Using depth: " << selectedDepthProfile->width() << "x" 
+                              << selectedDepthProfile->height() << " @" << selectedDepthProfile->fps() << "fps" << std::endl;
+                }
+                
+                if (selectedDepthProfile) {
+                    config->enableStream(selectedDepthProfile);
+                } else {
+                    config->enableVideoStream(OB_STREAM_DEPTH);
+                }
+            }
+            
+        } catch (const std::exception& e) {
+            std::cerr << "Error configuring streams: " << e.what() << std::endl;
+            // Fallback to simple configuration
+            config->enableVideoStream(OB_STREAM_COLOR);
+            config->enableVideoStream(OB_STREAM_DEPTH);
+        }
         
         // Enable frame sync if available
         try {
