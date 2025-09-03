@@ -395,7 +395,7 @@ std::shared_ptr<OrbbecCameraContext> setup_orbbec_camera(std::shared_ptr<ob::Dev
                         std::cout << "  " << width << "x" << height << " @" << fps << "fps, format: " << format << std::endl;
                     }
                     
-                    // Look for 640x480 with any supported format
+                    // Look for 640x480 with any supported format, prioritize 15fps
                     if (width == 640 && height == 480) {
                         if (!selectedColorProfile || (profile->fps() <= 30 && profile->fps() >= 15)) {  // Prefer 15-30fps for stability
                             selectedColorProfile = profile;
@@ -587,11 +587,100 @@ std::vector<char> compress_depth_lz4(const void* data, size_t size) {
     return compressed_buffer;
 }
 
-// ORBBEC camera thread
+// ORBBEC camera recovery function
+bool restart_orbbec_camera(std::shared_ptr<OrbbecCameraContext> camera_ctx) {
+    try {
+        std::cout << "ORBBEC " << camera_ctx->serial << " - Attempting recovery..." << std::endl;
+        
+        // Stop current pipeline
+        if (camera_ctx->pipeline) {
+            camera_ctx->pipeline->stop();
+        }
+        
+        // Wait for hardware to reset
+        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+        
+        // Reinitialize device
+        ob::Context ctx;
+        auto devList = ctx.queryDeviceList();
+        
+        for (uint32_t i = 0; i < devList->getCount(); i++) {
+            auto dev = devList->getDevice(i);
+            auto devInfo = dev->getDeviceInfo();
+            
+            if (std::string(devInfo->serialNumber()) == camera_ctx->serial) {
+                camera_ctx->device = dev;
+                camera_ctx->pipeline = std::make_shared<ob::Pipeline>(dev);
+                break;
+            }
+        }
+        
+        if (!camera_ctx->device || !camera_ctx->pipeline) {
+            std::cerr << "ORBBEC " << camera_ctx->serial << " - Device not found during recovery" << std::endl;
+            return false;
+        }
+        
+        // Configure with conservative settings
+        auto config = std::make_shared<ob::Config>();
+        
+        // Try to get 640x480 @15fps specifically
+        try {
+            auto colorProfiles = camera_ctx->pipeline->getStreamProfileList(OB_SENSOR_COLOR);
+            if (colorProfiles) {
+                for (uint32_t i = 0; i < colorProfiles->count(); i++) {
+                    auto profile = colorProfiles->getProfile(i)->as<ob::VideoStreamProfile>();
+                    if (profile->width() == 640 && profile->height() == 480 && profile->fps() == 15) {
+                        config->enableStream(profile);
+                        std::cout << "ORBBEC " << camera_ctx->serial << " - Recovery: Using 640x480@15fps color" << std::endl;
+                        break;
+                    }
+                }
+            }
+        } catch (...) {
+            config->enableVideoStream(OB_STREAM_COLOR);
+        }
+        
+        try {
+            auto depthProfiles = camera_ctx->pipeline->getStreamProfileList(OB_SENSOR_DEPTH);
+            if (depthProfiles) {
+                for (uint32_t i = 0; i < depthProfiles->count(); i++) {
+                    auto profile = depthProfiles->getProfile(i)->as<ob::VideoStreamProfile>();
+                    if (profile->width() == 640 && profile->height() == 480 && profile->fps() <= 30) {
+                        config->enableStream(profile);
+                        std::cout << "ORBBEC " << camera_ctx->serial << " - Recovery: Using depth @" << profile->fps() << "fps" << std::endl;
+                        break;
+                    }
+                }
+            }
+        } catch (...) {
+            config->enableVideoStream(OB_STREAM_DEPTH);
+        }
+        
+        // Restart pipeline
+        camera_ctx->pipeline->start(config, [camera_ctx](std::shared_ptr<ob::FrameSet> frameset) {
+            if (!frameset) return;
+            std::lock_guard<std::mutex> lock(camera_ctx->frameset_mutex);
+            camera_ctx->latest_frameset = frameset;
+            camera_ctx->new_frame_available = true;
+        });
+        
+        std::cout << "ORBBEC " << camera_ctx->serial << " - Recovery successful" << std::endl;
+        return true;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "ORBBEC " << camera_ctx->serial << " - Recovery failed: " << e.what() << std::endl;
+        return false;
+    }
+}
+
+// ORBBEC camera thread with recovery
 void orbbec_camera_thread_func(std::shared_ptr<OrbbecCameraContext> camera_ctx, SimplifiedUSBSynchronizer& synchronizer) {
     std::cout << "ORBBEC camera thread started for " << camera_ctx->serial << std::endl;
     int frame_count = 0;
     int consecutive_failures = 0;
+    auto last_recovery_attempt = std::chrono::steady_clock::now();
+    const int RECOVERY_THRESHOLD = 1000;
+    const auto RECOVERY_COOLDOWN = std::chrono::minutes(5);
 
     while (g_running) {
         try {
@@ -607,11 +696,25 @@ void orbbec_camera_thread_func(std::shared_ptr<OrbbecCameraContext> camera_ctx, 
             
             if (!frameset) {
                 consecutive_failures++;
-                if (consecutive_failures % 100 == 0) {
+                if (consecutive_failures % 500 == 0) {
                     std::cerr << "ORBBEC " << camera_ctx->serial << " - No frameset (failures: " 
                               << consecutive_failures << ")" << std::endl;
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                
+                // Attempt recovery if failures exceed threshold and cooldown period has passed
+                if (consecutive_failures >= RECOVERY_THRESHOLD) {
+                    auto now = std::chrono::steady_clock::now();
+                    if (now - last_recovery_attempt >= RECOVERY_COOLDOWN) {
+                        last_recovery_attempt = now;
+                        if (restart_orbbec_camera(camera_ctx)) {
+                            consecutive_failures = 0;
+                            std::this_thread::sleep_for(std::chrono::seconds(1));
+                            continue;
+                        }
+                    }
+                }
+                
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 continue;
             }
 
