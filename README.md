@@ -24,7 +24,7 @@ sudo apt update
 sudo apt install -y cmake build-essential pkg-config git wget
 sudo apt install -y libopencv-dev libzmq3-dev cppzmq-dev liblz4-dev
 sudo apt install -y libusb-1.0-0-dev libudev-dev
-
+sudo apt install -y nlohmann-json3-dev
 # Python dependencies for receiver
 pip3 install opencv-python zmq numpy lz4
 ```

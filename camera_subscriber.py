@@ -4,6 +4,7 @@ import cv2
 import lz4.frame
 import struct
 import time
+import sys
 
 def unpack_bundled_message(message_data):
     """解析打包消息"""
@@ -78,28 +79,38 @@ def unpack_bundled_message(message_data):
     return sync_group_count, cameras
 
 def main():
+    # 解析命令行参数
+    if len(sys.argv) > 1 and ':' in sys.argv[1]:
+        # 如果第一个参数包含冒号，认为是IP:PORT格式
+        publisher_endpoint = sys.argv[1]
+        if not publisher_endpoint.startswith('tcp://'):
+            publisher_endpoint = f"tcp://{publisher_endpoint}"
+        zmq_endpoint = publisher_endpoint
+    elif len(sys.argv) > 1:
+        # 只提供IP地址，使用默认端口
+        publisher_ip = sys.argv[1]
+        zmq_endpoint = f"tcp://{publisher_ip}:5555"
+    else:
+        # 使用默认配置
+        # zmq_endpoint = "tcp://192.168.11.82:5555"
+        zmq_endpoint = "tcp://192.168.1.33:5555"
+    
+    # 主题名称（可通过第二个参数覆盖）
+    zmq_topic = sys.argv[2] if len(sys.argv) > 2 else "D435i_STREAM"
+    
     context = zmq.Context()
     subscriber = context.socket(zmq.SUB)
-    subscriber.connect("tcp://192.168.11.82:5555")
-    # subscriber.connect("tcp://192.168.11.2:5555")
+    subscriber.connect(zmq_endpoint)
+    subscriber.setsockopt_string(zmq.SUBSCRIBE, zmq_topic)
+    print(f"订阅者已连接到 {zmq_endpoint}，主题: {zmq_topic}")
+    print("将根据接收到的消息自动检测相机数量")
 
-    # subscriber.connect("tcp://192.168.1.234:5555")
-    # subscriber.connect("tcp://192.168.35.213:5555")
-    # subscriber.connect("tcp://192.168.1.33:5555")
-    # subscriber.connect("tcp://192.168.253.200:5555")
-
-    
-    
-    subscriber.setsockopt_string(zmq.SUBSCRIBE, "D435i_STREAM")
-    # print("Subscriber connected to tcp://192.168.252.82:5555 (Bundled message mode)")
-
-    expected_cameras = []  # 将动态检测相机数量
+    expected_cameras = []  # 动态检测相机数量，不依赖配置
     window_created = False  # 跟踪窗口是否已创建
     
     # 性能监控变量
     frame_count = 0
     total_network_latency = 0
-    total_processing_time = 0
     max_latency = 0
     min_latency = float('inf')
     
@@ -143,10 +154,21 @@ def main():
                 frame_count += 1
                 print(f"Successfully unpacked {len(cameras)} cameras from sync group #{sync_group_count}")
                 
-                # 动态适应相机数量
+                # 动态适应相机数量（根据实际接收到的消息）
                 if not expected_cameras and cameras:
-                    expected_cameras = list(cameras.keys())
-                    print(f"Auto-detected {len(expected_cameras)} cameras: {expected_cameras}")
+                    expected_cameras = sorted(list(cameras.keys()))  # 排序以保证顺序一致
+                    print(f"自动检测到 {len(expected_cameras)} 个相机: {expected_cameras}")
+                elif expected_cameras and set(cameras.keys()) != set(expected_cameras):
+                    # 相机列表发生变化
+                    old_cameras = set(expected_cameras)
+                    new_cameras = set(cameras.keys())
+                    added = new_cameras - old_cameras
+                    removed = old_cameras - new_cameras
+                    if added:
+                        print(f"新增相机: {added}")
+                    if removed:
+                        print(f"断开相机: {removed}")
+                    expected_cameras = sorted(list(new_cameras))
             except Exception as e:
                 print(f"Error unpacking message: {e}")
                 continue
@@ -288,4 +310,16 @@ def main():
     cv2.destroyAllWindows()
 
 if __name__ == "__main__":
+    print("\n相机订阅器启动")
+    print("使用方法:")
+    print("  python camera_subscriber.py                     # 使用默认地址 192.168.11.82:5555")
+    print("  python camera_subscriber.py <IP>                # 指定IP，默认端口5555")
+    print("  python camera_subscriber.py <IP:PORT>           # 指定IP和端口")
+    print("  python camera_subscriber.py <IP:PORT> <TOPIC>   # 指定IP、端口和主题")
+    print("\n示例:")
+    print("  python camera_subscriber.py 192.168.1.100")
+    print("  python camera_subscriber.py 192.168.1.100:5556")
+    print("  python camera_subscriber.py 192.168.1.100:5556 MY_TOPIC")
+    print("\n说明: 订阅器将根据接收到的消息自动检测相机数量")
+    print("-" * 50)
     main()

@@ -1,0 +1,33 @@
+{
+  "cameras": [
+    {
+      "serial_number": "243322073850",
+      "enabled": true,
+      "type": "RealSense",
+      "name": "Camera 1"
+    },
+    {
+      "serial_number": "243222076185",
+      "enabled": true,
+      "type": "RealSense",
+      "name": "Camera 2"
+    },
+    {
+      "serial_number": "243322073237",
+      "enabled": true,
+      "type": "RealSense",
+      "name": "Camera 3"
+    }
+  ],
+  "settings": {
+    "zmq_endpoint": "tcp://*:5555",
+    "zmq_topic": "D435i_STREAM",
+    "publisher_ip": "192.168.11.82",
+    "zmq_port": "5555",
+    "color_width": 640,
+    "color_height": 480,
+    "depth_width": 640,
+    "depth_height": 480,
+    "fps": 15
+  }
+}

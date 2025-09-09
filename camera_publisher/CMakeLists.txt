@@ -67,6 +67,25 @@ link_directories(${OpenCV_LIBRARY_DIRS})
 # 查找线程库
 find_package(Threads REQUIRED)
 
+# 查找nlohmann/json库
+find_package(nlohmann_json QUIET)
+if(NOT nlohmann_json_FOUND)
+    # 如果没有找到，尝试手动查找
+    find_path(JSON_INCLUDE_DIR
+        NAMES nlohmann/json.hpp
+        PATHS
+        /usr/include
+        /usr/local/include
+    )
+    if(JSON_INCLUDE_DIR)
+        message(STATUS "Found nlohmann/json manually at ${JSON_INCLUDE_DIR}")
+    else()
+        message(WARNING "nlohmann/json not found! Configuration file support will be disabled.")
+    endif()
+else()
+    message(STATUS "Found nlohmann/json via cmake")
+endif()
+
 # 查找ZeroMQ
 if(PkgConfig_FOUND)
     pkg_check_modules(PC_ZeroMQ QUIET zmq)

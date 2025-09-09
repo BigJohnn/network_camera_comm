@@ -9,6 +9,9 @@
 #include <condition_variable>
 #include <queue>
 #include <map>
+#include <fstream>
+#include <algorithm>
+#include <nlohmann/json.hpp>
 #include <zmq.hpp>
 #include <librealsense2/rs.hpp>
 #include <opencv2/opencv.hpp>
@@ -36,14 +39,14 @@ struct OrbbecCameraContext {
 
 // --- USB连接优化配置 ---
 std::vector<std::string> SERIAL_NUMBERS;
-const std::string ZMQ_ENDPOINT = "tcp://*:5555";
-const std::string ZMQ_TOPIC = "D435i_STREAM";
+std::string ZMQ_ENDPOINT = "tcp://*:5555";
+std::string ZMQ_TOPIC = "D435i_STREAM";
 
-const int COLOR_WIDTH = 640;
-const int COLOR_HEIGHT = 480;
-const int DEPTH_WIDTH = 640;
-const int DEPTH_HEIGHT = 480;
-const int FPS = 10;
+int COLOR_WIDTH = 640;
+int COLOR_HEIGHT = 480;
+int DEPTH_WIDTH = 640;
+int DEPTH_HEIGHT = 480;
+int FPS = 10;
 
 // USB连接专用同步设定
 const int64_t SYNC_WINDOW_MS = 100;
@@ -58,6 +61,16 @@ enum class CameraType {
     REALSENSE,
     ORBBEC
 };
+
+// 配置结构
+struct CameraConfig {
+    std::string serial_number;
+    bool enabled;
+    CameraType type;
+    std::string name;
+};
+
+std::vector<CameraConfig> CAMERA_CONFIGS;
 
 // 简化的帧数据结构
 struct SimpleFrameData {
@@ -911,24 +924,136 @@ void zmq_publisher_thread(zmq::socket_t& publisher, SimplifiedUSBSynchronizer& s
     std::cout << "ZMQ publisher thread stopping." << std::endl;
 }
 
-int main() {
+// 加载配置文件
+bool load_config(const std::string& config_file) {
+    try {
+        std::ifstream file(config_file);
+        if (!file.is_open()) {
+            std::cerr << "Cannot open config file: " << config_file << std::endl;
+            return false;
+        }
+        
+        nlohmann::json config;
+        file >> config;
+        
+        // 读取相机配置
+        CAMERA_CONFIGS.clear();
+        SERIAL_NUMBERS.clear();
+        
+        for (const auto& cam : config["cameras"]) {
+            if (cam["enabled"].get<bool>()) {
+                CameraConfig cfg;
+                cfg.serial_number = cam["serial_number"].get<std::string>();
+                cfg.enabled = true;
+                cfg.name = cam["name"].get<std::string>();
+                
+                std::string type_str = cam["type"].get<std::string>();
+                // Convert to uppercase for case-insensitive comparison
+                std::transform(type_str.begin(), type_str.end(), type_str.begin(), ::toupper);
+                
+                if (type_str == "REALSENSE") {
+                    cfg.type = CameraType::REALSENSE;
+                } else if (type_str == "ORBBEC") {
+                    cfg.type = CameraType::ORBBEC;
+                } else {
+                    std::cerr << "Unknown camera type: " << type_str << std::endl;
+                    continue;
+                }
+                
+                CAMERA_CONFIGS.push_back(cfg);
+                SERIAL_NUMBERS.push_back(cfg.serial_number);
+                
+                std::cout << "Config: Enabled camera " << cfg.name 
+                         << " (" << cfg.serial_number << ", " << type_str << ")" << std::endl;
+            }
+        }
+        
+        // 读取设置
+        if (config.contains("settings")) {
+            const auto& settings = config["settings"];
+            if (settings.contains("zmq_endpoint")) {
+                ZMQ_ENDPOINT = settings["zmq_endpoint"].get<std::string>();
+            }
+            if (settings.contains("zmq_topic")) {
+                ZMQ_TOPIC = settings["zmq_topic"].get<std::string>();
+            }
+            if (settings.contains("color_width")) {
+                COLOR_WIDTH = settings["color_width"].get<int>();
+            }
+            if (settings.contains("color_height")) {
+                COLOR_HEIGHT = settings["color_height"].get<int>();
+            }
+            if (settings.contains("depth_width")) {
+                DEPTH_WIDTH = settings["depth_width"].get<int>();
+            }
+            if (settings.contains("depth_height")) {
+                DEPTH_HEIGHT = settings["depth_height"].get<int>();
+            }
+            if (settings.contains("fps")) {
+                FPS = settings["fps"].get<int>();
+            }
+        }
+        
+        std::cout << "\nConfiguration loaded:" << std::endl;
+        std::cout << "  - Cameras to start: " << CAMERA_CONFIGS.size() << std::endl;
+        std::cout << "  - ZMQ endpoint: " << ZMQ_ENDPOINT << std::endl;
+        std::cout << "  - Resolution: " << COLOR_WIDTH << "x" << COLOR_HEIGHT << std::endl;
+        std::cout << "  - FPS: " << FPS << std::endl;
+        
+        return !CAMERA_CONFIGS.empty();
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Error loading config: " << e.what() << std::endl;
+        return false;
+    }
+}
+
+int main(int argc, char* argv[]) {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
-
-    // Detect all cameras
-    auto detected_cameras = detect_connected_cameras();
     
-    if (detected_cameras.empty()) {
-        std::cerr << "No cameras found!" << std::endl;
+    // 配置文件路径
+    std::string config_file = "../camera_config.json";
+    if (argc > 1) {
+        config_file = argv[1];
+    }
+    
+    // 加载配置
+    if (!load_config(config_file)) {
+        std::cerr << "Failed to load configuration from " << config_file << std::endl;
+        std::cerr << "Usage: " << argv[0] << " [config_file]" << std::endl;
         return 1;
     }
 
-    // Extract serial numbers
-    SERIAL_NUMBERS.clear();
+    // Detect all connected cameras
+    auto detected_cameras = detect_connected_cameras();
+    
+    // 验证配置的相机是否存在
+    std::vector<std::pair<std::string, CameraType>> cameras_to_use;
     std::map<std::string, CameraType> camera_types;
-    for (const auto& camera : detected_cameras) {
-        SERIAL_NUMBERS.push_back(camera.first);
-        camera_types[camera.first] = camera.second;
+    
+    for (const auto& cfg : CAMERA_CONFIGS) {
+        bool found = false;
+        for (const auto& detected : detected_cameras) {
+            if (detected.first == cfg.serial_number && detected.second == cfg.type) {
+                cameras_to_use.push_back({cfg.serial_number, cfg.type});
+                camera_types[cfg.serial_number] = cfg.type;
+                std::cout << "Found configured camera: " << cfg.name 
+                         << " (" << cfg.serial_number << ")" << std::endl;
+                found = true;
+                break;
+            }
+        }
+        
+        if (!found) {
+            std::cerr << "WARNING: Configured camera not found: " << cfg.name 
+                     << " (" << cfg.serial_number << ")" << std::endl;
+        }
+    }
+    
+    if (cameras_to_use.empty()) {
+        std::cerr << "No configured cameras found!" << std::endl;
+        return 1;
     }
 
     // Initialize ZMQ
@@ -945,9 +1070,9 @@ int main() {
     std::vector<std::thread> camera_threads;
 
     try {
-        // Initialize ORBBEC cameras (if any) - based on official example
+        // Initialize only configured ORBBEC cameras
         std::vector<std::string> orbbec_serials;
-        for (const auto& camera : detected_cameras) {
+        for (const auto& camera : cameras_to_use) {
             if (camera.second == CameraType::ORBBEC) {
                 orbbec_serials.push_back(camera.first);
             }
@@ -976,12 +1101,13 @@ int main() {
             }
         }
         
-        // Initialize RealSense cameras
-        for (const auto& camera : detected_cameras) {
+        // Initialize only configured RealSense cameras
+        for (const auto& camera : cameras_to_use) {
             if (camera.second == CameraType::REALSENSE) {
                 try {
                     rs2::pipeline pipe = setup_realsense_camera(camera.first);
                     realsense_pipelines.push_back(std::move(pipe));
+                    std::cout << "RealSense camera " << camera.first << " initialized" << std::endl;
                 } catch (const std::exception& e) {
                     std::cerr << "Failed to initialize RealSense " << camera.first << ": " << e.what() << std::endl;
                 }
@@ -1000,7 +1126,7 @@ int main() {
         
         // Start RealSense camera threads
         size_t rs_index = 0;
-        for (const auto& camera : detected_cameras) {
+        for (const auto& camera : cameras_to_use) {
             if (camera.second == CameraType::REALSENSE && rs_index < realsense_pipelines.size()) {
                 camera_threads.push_back(std::thread(realsense_camera_thread_func, 
                                                    std::ref(realsense_pipelines[rs_index]), 
