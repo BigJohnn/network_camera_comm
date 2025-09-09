@@ -51,13 +51,15 @@ def unpack_bundled_message(message_data):
             if color_frame is None:
                 print(f"Error: Failed to decode color frame for camera {serial}")
                 continue
-            elif color_frame.shape[:2] != (480, 640):
-                print(f"Warning: Color frame shape for {serial} is {color_frame.shape} instead of (480, 640)")
+            
+            # 获取彩色帧的实际尺寸
+            color_height, color_width = color_frame.shape[:2]
             
             # 解码深度帧
             try:
                 decompressed_depth = lz4.frame.decompress(depth_data)
-                depth_frame = np.frombuffer(decompressed_depth, dtype=np.uint16).reshape(480, 640)
+                # 根据彩色帧的尺寸来推断深度帧的尺寸
+                depth_frame = np.frombuffer(decompressed_depth, dtype=np.uint16).reshape(color_height, color_width)
             except Exception as e:
                 print(f"Error: Failed to decode depth frame for camera {serial}: {e}")
                 continue
@@ -78,10 +80,15 @@ def unpack_bundled_message(message_data):
 def main():
     context = zmq.Context()
     subscriber = context.socket(zmq.SUB)
-    subscriber.connect("tcp://192.168.252.82:5555")
+    subscriber.connect("tcp://192.168.11.82:5555")
+    # subscriber.connect("tcp://192.168.11.2:5555")
+
     # subscriber.connect("tcp://192.168.1.234:5555")
     # subscriber.connect("tcp://192.168.35.213:5555")
-    # subscriber.connect("tcp://192.168.11.2:5555")
+    # subscriber.connect("tcp://192.168.1.33:5555")
+    # subscriber.connect("tcp://192.168.253.200:5555")
+
+    
     
     subscriber.setsockopt_string(zmq.SUBSCRIBE, "D435i_STREAM")
     # print("Subscriber connected to tcp://192.168.252.82:5555 (Bundled message mode)")
