@@ -18,7 +18,8 @@ def unpack_bundled_message(message_data):
     camera_count = struct.unpack('<i', message_data[offset:offset+4])[0]
     offset += 4
     
-    print(f"Unpacking sync group #{sync_group_count} with {camera_count} cameras")
+    # 不再每次都打印，减少IO开销
+    # print(f"Unpacking sync group #{sync_group_count} with {camera_count} cameras")
     
     # 解析每个相机的数据
     for i in range(camera_count):
@@ -100,9 +101,22 @@ def main():
     
     context = zmq.Context()
     subscriber = context.socket(zmq.SUB)
+    
+    # 优化ZMQ socket设置 - 针对15 FPS优化
+    subscriber.setsockopt(zmq.RCVHWM, 1)  # 接收高水位标记设为1，只保留最新消息
+    subscriber.setsockopt(zmq.LINGER, 0)  # 关闭时不等待
+    subscriber.setsockopt(zmq.RCVTIMEO, 100)  # 接收超时100ms (更宽容)
+    subscriber.setsockopt(zmq.RCVBUF, 1048576)  # 接收缓冲区1MB
+    subscriber.setsockopt(zmq.TCP_KEEPALIVE, 1)  # 启用TCP keepalive
+    subscriber.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 1)  # 1秒后开始keepalive
+    subscriber.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 1)  # keepalive间隔1秒
+    
+    # 注意：CONFLATE选项不能用于SUB socket，会导致断言错误
+    
     subscriber.connect(zmq_endpoint)
     subscriber.setsockopt_string(zmq.SUBSCRIBE, zmq_topic)
     print(f"订阅者已连接到 {zmq_endpoint}，主题: {zmq_topic}")
+    print("ZMQ优化设置：RCVHWM=1, RCVTIMEO=100ms, RCVBUF=1MB (15 FPS优化)")
     print("将根据接收到的消息自动检测相机数量")
 
     expected_cameras = []  # 动态检测相机数量，不依赖配置
@@ -118,6 +132,10 @@ def main():
     clock_offset = 0
     clock_offset_samples = []
     is_clock_synced = True
+    
+    # 性能统计
+    last_frame_time = time.time()
+    frame_intervals = []
 
     while True:
         try:
@@ -125,34 +143,55 @@ def main():
             receive_time = int(time.time() * 1000)
             processing_start = time.time()
             
-            # 接收打包消息 (带超时)
-            if subscriber.poll(100):  # 缩短等待时间到100ms
-                topic = subscriber.recv_string(zmq.NOBLOCK)
-                bundled_data = subscriber.recv(zmq.NOBLOCK)
-                print(f"Received message with topic: {topic}, data size: {len(bundled_data)} bytes")
+            # 接收消息（使用RCVTIMEO超时设置）
+            try:
+                # 接收一条消息
+                _ = subscriber.recv_string()  # 阻塞接收，依赖RCVTIMEO (topic)
+                bundled_data = subscriber.recv()
                 
-                # 清理积压的消息，只处理最新的
-                messages_dropped = 0
-                while subscriber.poll(0):  # 立即检查是否还有消息
+                # 激进地清理所有积压消息，只保留最新的
+                latest_data = bundled_data
+                messages_cleared = 0
+                while subscriber.poll(0):  # 检查是否还有消息
                     try:
-                        subscriber.recv_string(zmq.NOBLOCK)
-                        subscriber.recv(zmq.NOBLOCK)
-                        messages_dropped += 1
+                        _ = subscriber.recv_string(zmq.NOBLOCK)
+                        latest_data = subscriber.recv(zmq.NOBLOCK)  # 更新为最新消息
+                        messages_cleared += 1
                     except zmq.Again:
                         break
                 
-                if messages_dropped > 0:
-                    print(f"Dropped {messages_dropped} old messages to stay current")
+                bundled_data = latest_data  # 使用最新的消息
+                
+                # 总是报告清理的消息数，帮助诊断
+                if messages_cleared > 0:
+                    if frame_count % 10 == 0:
+                        print(f"⚠️ Cleared {messages_cleared} old messages (backlog detected)")
+                    # 累计统计
+                    if not hasattr(main, 'total_cleared'):
+                        main.total_cleared = 0
+                    main.total_cleared = getattr(main, 'total_cleared', 0) + messages_cleared
+                
+                # 仅在调试模式下打印详细信息
+                if frame_count % 10 == 0:
+                    print(f"Frame #{frame_count}: Received {len(bundled_data)} bytes")
                     
-            else:
-                print("No message received in 100ms...")
+            except zmq.Again:
+                # 超时，继续等待
                 continue
+            except zmq.error.ZMQError as e:
+                if e.errno == zmq.EAGAIN:
+                    continue
+                else:
+                    print(f"ZMQ Error: {e}")
+                    continue
             
             # 解析打包消息
             try:
                 sync_group_count, cameras = unpack_bundled_message(bundled_data)
                 frame_count += 1
-                print(f"Successfully unpacked {len(cameras)} cameras from sync group #{sync_group_count}")
+                # 减少日志输出频率
+                if frame_count % 30 == 0:
+                    print(f"Frame #{frame_count}: Processing sync group #{sync_group_count}")
                 
                 # 动态适应相机数量（根据实际接收到的消息）
                 if not expected_cameras and cameras:
@@ -174,9 +213,7 @@ def main():
                 continue
             
             # 检查是否收到了所有期望的相机
-            print(f"Processing cameras: received {len(cameras)}, expected {len(expected_cameras)}")
             if cameras and len(cameras) >= len(expected_cameras):
-                print("Starting frame processing...")
                 display_frames = []
                 
                 network_latencies = []
@@ -252,38 +289,59 @@ def main():
                         display_frames.append(combined_camera_view)
 
                 # 显示完美同步的画面
-                print(f"Display frames ready: {len(display_frames)}/{len(expected_cameras)}")
                 if len(display_frames) == len(expected_cameras):
-                    print("Creating final view...")
                     final_view = np.vstack(display_frames)
                     window_title = f'Multi-Camera Synchronized Stream ({len(expected_cameras)} cameras)'
                     
                     # 首次创建窗口时设置属性
                     if not window_created:
                         cv2.namedWindow(window_title, cv2.WINDOW_AUTOSIZE)
+                        # 尝试优化显示性能（兼容不同OpenCV版本）
+                        try:
+                            cv2.setWindowProperty(window_title, cv2.WND_PROP_ASPECTRATIO, cv2.WINDOW_FREERATIO)
+                        except AttributeError:
+                            # 旧版本OpenCV可能没有这些属性，跳过
+                            pass
                         window_created = True
                         print(f"Created window: {window_title}")
                     
-                    print(f"Showing frame #{frame_count}")
                     cv2.imshow(window_title, final_view)
                     cv2.waitKey(1)  # 立即处理事件
-                    print("Frame displayed successfully")
+                    
+                    # 更新帧率统计
+                    current_time = time.time()
+                    frame_interval = current_time - last_frame_time
+                    last_frame_time = current_time
+                    frame_intervals.append(frame_interval)
+                    if len(frame_intervals) > 30:
+                        frame_intervals.pop(0)
                     
                     # 每30帧输出延迟统计
                     if frame_count % 30 == 0:
                         avg_latency = total_network_latency / frame_count
                         avg_network_latency = sum(network_latencies) / len(network_latencies)
-                        print(f"Frame #{frame_count}: Avg Latency: {avg_latency:.1f}ms, "
-                              f"Current Avg: {avg_network_latency:.1f}ms, "
-                              f"Min: {min_latency}ms, Max: {max_latency}ms, "
-                              f"Proc: {processing_time:.1f}ms")
+                        
+                        # 计算处理总时间
+                        total_proc_time = (time.time() - processing_start) * 1000
+                        
+                        print(f"\n📊 Frame #{frame_count} Performance:")
+                        print(f"  Network Latency: avg={avg_latency:.1f}ms, current={avg_network_latency:.1f}ms")
+                        print(f"  Range: {min_latency:.1f}ms - {max_latency:.1f}ms")
+                        print(f"  Processing: {processing_time:.1f}ms (decode+display)")
+                        print(f"  Total frame time: {total_proc_time:.1f}ms")
+                        
+                        # 消息积压统计
+                        if hasattr(main, 'total_cleared'):
+                            clear_rate = main.total_cleared / frame_count
+                            print(f"  ⚠️ Message backlog: {main.total_cleared} cleared ({clear_rate:.2f}/frame)")
+                        
                         if not is_clock_synced:
-                            print(f"Clock offset applied: {clock_offset:.1f}ms")
+                            print(f"  Clock offset: {clock_offset:.1f}ms")
                         
                         # 显示最近几帧的原始延迟用于调试
                         if len(network_latencies) >= 3:
                             recent_raw = [receive_time - cameras[s]["timestamp"] for s in expected_cameras if s in cameras]
-                            print(f"Recent raw latencies: {[f'{x:.1f}' for x in recent_raw[-3:]]}")
+                            print(f"  Raw latencies: {[f'{x:.1f}' for x in recent_raw[-3:]]}")
             else:
                 print(f"Warning: Received {len(cameras)} cameras, expected {len(expected_cameras)}")
 
@@ -295,9 +353,19 @@ def main():
             elif key != 255:  # 如果按了任何键
                 print(f"Key pressed: {key}")
             
-            # 定期状态输出
-            if frame_count > 0 and frame_count % 10 == 0:
-                print(f"Processed {frame_count} frames so far...")
+            # 减少状态输出频率
+            if frame_count > 0 and frame_count % 100 == 0:
+                avg_latency = total_network_latency / frame_count
+                print(f"\n=== Status: {frame_count} frames processed ===")
+                print(f"Average latency: {avg_latency:.1f}ms, Min: {min_latency:.1f}ms, Max: {max_latency:.1f}ms")
+                
+                # 计算实际FPS
+                if len(frame_intervals) > 0:
+                    avg_interval = sum(frame_intervals) / len(frame_intervals)
+                    actual_fps = 1.0 / avg_interval if avg_interval > 0 else 0
+                    print(f"Actual display FPS: {actual_fps:.1f}")
+                
+                print("="*40)
 
         except zmq.Again:
             continue

@@ -48,10 +48,10 @@ int DEPTH_WIDTH = 640;
 int DEPTH_HEIGHT = 480;
 int FPS = 10;
 
-// USB连接专用同步设定
-const int64_t SYNC_WINDOW_MS = 100;
-const int64_t MAX_FRAME_AGE_MS = 200;
-const int MAX_BUFFER_SIZE = 5;
+// USB连接专用同步设定 - 激进优化以追求更高FPS
+const int64_t SYNC_WINDOW_MS = 40;  // 减少同步窗口提高响应速度
+const int64_t MAX_FRAME_AGE_MS = 80;  // 减少帧年龄避免累积
+const int MAX_BUFFER_SIZE = 2;  // 最小缓冲减少延迟
 
 // 全局变量
 std::atomic<bool> g_running(true);
@@ -116,12 +116,23 @@ public:
     
     bool get_synchronized_frames(std::vector<SimpleFrameData>& frames) {
         std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait_for(lock, std::chrono::milliseconds(100), 
+        cv_.wait_for(lock, std::chrono::milliseconds(40),  // 减少等待时间提高响应
                     [this] { return !sync_queue_.empty() || !g_running; });
         
         if (!g_running) return false;
         
         if (!sync_queue_.empty()) {
+            // 清空队列，只使用最新的同步帧
+            int dropped = 0;
+            while (sync_queue_.size() > 1) {
+                sync_queue_.pop();  // 丢弃旧的同步帧
+                dropped++;
+            }
+            
+            if (dropped > 0) {
+                std::cout << "⚠️ Dropped " << dropped << " old sync groups" << std::endl;
+            }
+            
             frames = sync_queue_.front();
             sync_queue_.pop();
             return true;
@@ -814,7 +825,7 @@ void realsense_camera_thread_func(rs2::pipeline& pipe, const std::string& serial
 
     while (g_running) {
         try {
-            rs2::frameset frames = pipe.wait_for_frames(1000);
+            rs2::frameset frames = pipe.wait_for_frames(500);  // 增加等待时间避免超时
             if (!frames) continue;
 
             frames = align_to_color.process(frames);
@@ -839,11 +850,31 @@ void realsense_camera_thread_func(rs2::pipeline& pipe, const std::string& serial
             synchronizer.add_frame(frame_data);
             
             if (frame_count % 30 == 0) {
-                std::cout << "RealSense " << serial << " - Frame " << frame_count << std::endl;
+                auto now = std::chrono::steady_clock::now();
+                static std::map<std::string, std::chrono::steady_clock::time_point> last_time;
+                if (last_time.find(serial) != last_time.end()) {
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_time[serial]).count();
+                    float camera_fps = elapsed > 0 ? 30000.0f / elapsed : 0;
+                    std::cout << "RealSense " << serial << " - Frame " << frame_count 
+                             << " (✓ " << camera_fps << " FPS)" << std::endl;
+                } else {
+                    std::cout << "RealSense " << serial << " - Frame " << frame_count << " (✓ OK)" << std::endl;
+                }
+                last_time[serial] = now;
             }
             
         } catch (const std::exception& e) {
-            std::cerr << "RealSense error for " << serial << ": " << e.what() << std::endl;
+            std::string error_msg = e.what();
+            if (error_msg.find("didn't arrive") != std::string::npos) {
+                // 只每10次超时打印一次，避免日志泛滥
+                static std::map<std::string, int> timeout_counts;
+                timeout_counts[serial]++;
+                if (timeout_counts[serial] % 10 == 1) {
+                    std::cerr << "⚠️ RealSense " << serial << " timeout (count: " << timeout_counts[serial] << ")" << std::endl;
+                }
+            } else {
+                std::cerr << "RealSense error for " << serial << ": " << error_msg << std::endl;
+            }
         }
     }
     
@@ -854,6 +885,12 @@ void realsense_camera_thread_func(rs2::pipeline& pipe, const std::string& serial
 void zmq_publisher_thread(zmq::socket_t& publisher, SimplifiedUSBSynchronizer& synchronizer) {
     std::cout << "ZMQ publisher thread started" << std::endl;
     int sync_group_count = 0;
+    int frames_sent = 0;
+    auto start_time = std::chrono::steady_clock::now();
+    auto last_frame_time = start_time;
+    
+    // 帧率限制：确保不超过配置的FPS
+    const int target_interval_ms = 1000 / FPS;  // 15 FPS = 66ms
     
     while (g_running) {
         std::vector<SimpleFrameData> synced_frames;
@@ -861,6 +898,18 @@ void zmq_publisher_thread(zmq::socket_t& publisher, SimplifiedUSBSynchronizer& s
         if (!synchronizer.get_synchronized_frames(synced_frames)) {
             continue;
         }
+        
+        // 移除帧率限制 - 让系统以最快速度运行
+        // 注释掉帧率限制，让相机以实际能力运行
+        /*
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_frame_time).count();
+        
+        if (elapsed < target_interval_ms - 10) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(target_interval_ms - elapsed - 10));
+        }
+        */
+        last_frame_time = std::chrono::steady_clock::now();
         
         try {
             sync_group_count++;
@@ -878,7 +927,8 @@ void zmq_publisher_thread(zmq::socket_t& publisher, SimplifiedUSBSynchronizer& s
             for (const SimpleFrameData& frame_data : synced_frames) {
                 std::vector<uchar> color_encoded;
                 cv::imencode(".jpg", frame_data.color_mat, color_encoded, 
-                            std::vector<int>{cv::IMWRITE_JPEG_QUALITY, 65});
+                            std::vector<int>{cv::IMWRITE_JPEG_QUALITY, 40,     // 进一步降低质量提高速度
+                                           cv::IMWRITE_JPEG_OPTIMIZE, 0});   // 禁用优化加快编码
                 
                 int32_t serial_len = static_cast<int32_t>(frame_data.serial.length());
                 bundled_message.insert(bundled_message.end(), 
@@ -910,10 +960,21 @@ void zmq_publisher_thread(zmq::socket_t& publisher, SimplifiedUSBSynchronizer& s
             
             publisher.send(zmq::buffer(ZMQ_TOPIC), zmq::send_flags::sndmore);
             publisher.send(zmq::buffer(bundled_message), zmq::send_flags::none);
+            frames_sent++;
             
             if (sync_group_count % 30 == 0) {
-                std::cout << "Sent sync group #" << sync_group_count 
-                          << " with " << synced_frames.size() << " cameras" << std::endl;
+                auto now = std::chrono::steady_clock::now();
+                auto total_elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+                float actual_fps = total_elapsed > 0 ? (float)frames_sent / total_elapsed : 0;
+                
+                std::cout << "📤 Sync group #" << sync_group_count 
+                          << " | Cameras: " << synced_frames.size() 
+                          << " | Size: " << bundled_message.size() / 1024 << "KB"
+                          << " | FPS: " << actual_fps 
+                          << " (target: " << FPS << ") | Sync range: " 
+                          << (synced_frames.empty() ? 0 : 
+                              synced_frames.back().system_time - synced_frames.front().system_time) 
+                          << "ms" << std::endl;
             }
                       
         } catch (const std::exception& e) {
@@ -1056,11 +1117,28 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Initialize ZMQ
+    // Initialize ZMQ with optimized settings
     zmq::context_t context(1);
     zmq::socket_t publisher(context, zmq::socket_type::pub);
+    
+    // 优化ZMQ发布端设置
+    int hwm = 1;  // 高水位标记设为1，只保留最新消息
+    publisher.setsockopt(ZMQ_SNDHWM, &hwm, sizeof(hwm));
+    
+    int linger = 0;  // 关闭时不等待
+    publisher.setsockopt(ZMQ_LINGER, &linger, sizeof(linger));
+    
+    // 设置发送缓冲区大小 (每条消息约430KB，设置为512KB)
+    int sndbuf = 524288;  // 512KB - 刚好够一条消息
+    publisher.setsockopt(ZMQ_SNDBUF, &sndbuf, sizeof(sndbuf));
+    
+    // 设置立即发送
+    int immediate = 1;
+    publisher.setsockopt(ZMQ_IMMEDIATE, &immediate, sizeof(immediate));
+    
     publisher.bind(ZMQ_ENDPOINT);
     std::cout << "Publisher bound to " << ZMQ_ENDPOINT << std::endl;
+    std::cout << "ZMQ optimized: SNDHWM=1, LINGER=0, SNDBUF=512KB, IMMEDIATE=1" << std::endl;
 
     // Initialize synchronizer
     SimplifiedUSBSynchronizer synchronizer;
